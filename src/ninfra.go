@@ -79,9 +79,10 @@ func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 	return nil
 }
 
-func executeConcurrently(configs map[string]string, args []string, username string, parallelism int, action ActionFunc) {
+func executeConcurrently(configs map[string]string, args []string, username string, parallelism int, action ActionFunc) error {
 	semaphore := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
+	errors := make(chan error, len(configs))
 
 	for host, address := range configs {
 		wg.Add(1)
@@ -98,12 +99,22 @@ func executeConcurrently(configs map[string]string, args []string, username stri
 			}
 
 			if err := executeAndStreamOutput(host, cmd); err != nil {
-				fmt.Println(err)
+				errors <- fmt.Errorf("%s: %w", host, err)
 			}
 		}(host, address)
 	}
 
 	wg.Wait() // Wait for all goroutines to finish
+	close(errors)
+
+	if len(errors) > 0 {
+		for err := range errors {
+			fmt.Println(err)
+		}
+		return fmt.Errorf("One or more commands failed")
+	}
+
+	return nil
 }
 
 func filterConfigurations(configs Configurations, filter string) Configurations {
@@ -130,12 +141,41 @@ func sshAction(host, address string, args []string, username string) *exec.Cmd {
 }
 
 func nixosRebuildAction(host, address string, args []string, username string) *exec.Cmd {
+	hostAttr := fmt.Sprintf(".#%s", host)
+	sshTgt := fmt.Sprintf("%s@%s", username, address)
 	if len(args) == 0 {
 		args = []string{"switch"} // Default action
 	}
+	return exec.Command("nixos-rebuild", args[0], "--flake", hostAttr, "--target-host", sshTgt)
+}
+
+func nixosBuildAction(host, address string, username string) *exec.Cmd {
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTgt := fmt.Sprintf("%s@%s", username, address)
-	return exec.Command("nixos-rebuild", args[0], "--flake", hostAttr, "--target-host", sshTgt)
+	return exec.Command("nixos-rebuild", "build", "--flake", hostAttr, "--target-host", sshTgt)
+}
+
+func applyWithBuild(configs Configurations, args []string, username string, parallelism int) {
+	fmt.Println("Starting build phase on all nodes...")
+	if err := executeConcurrently(configs, nil, username, parallelism, nixosBuildAction); err != nil {
+		fmt.Println("Build phase failed. Aborting apply phase.")
+		os.Exit(1)
+	}
+
+	fmt.Println("Build phase succeeded. Starting apply phase...")
+	action := "switch"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	finalArgs := []string{action}
+	if len(args) > 1 {
+		finalArgs = append(finalArgs, args[1:]...)
+	}
+
+	if err := executeConcurrently(configs, finalArgs, username, parallelism, nixosRebuildAction); err != nil {
+		fmt.Println("Apply phase failed.")
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -176,7 +216,7 @@ func main() {
 		executeConcurrently(filteredConfigs, args[1:], username, parallelism, sshAction)
 
 	case "apply":
-		executeConcurrently(filteredConfigs, args[1:], username, parallelism, nixosRebuildAction)
+		applyWithBuild(filteredConfigs, args[1:], username, parallelism)
 
 	default:
 		fmt.Printf("Error: Unknown subcommand '%s'.\n", subcommand)
