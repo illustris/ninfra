@@ -149,7 +149,7 @@ func nixosRebuildAction(host, address string, args []string, username string) *e
 	return exec.Command("nixos-rebuild", args[0], "--flake", hostAttr, "--target-host", sshTgt)
 }
 
-func nixosBuildAction(host, address string, username string) *exec.Cmd {
+func nixosBuildAction(host, address string, args []string, username string) *exec.Cmd {
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTgt := fmt.Sprintf("%s@%s", username, address)
 	return exec.Command("nixos-rebuild", "build", "--flake", hostAttr, "--target-host", sshTgt)
