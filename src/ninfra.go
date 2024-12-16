@@ -25,6 +25,7 @@ Options:
   --on <filter>       Set the filter to apply (default: .*)
   -l <username>       Specify the username for the target host (default: current user)
   -P <parallelism>    Specify the number of parallel jobs (default: 1)
+  -d <deploy.nix>     Use a custom nix expression file to generate the target and config attrset
   -h, --help          Display this help message
 
 Arguments:
