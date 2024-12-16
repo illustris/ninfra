@@ -33,8 +33,11 @@ Arguments:
 `)
 }
 
+var deployFilePath = "default.nix"
+
 func parseConfigurations() (Configurations, error) {
-	data, err := ioutil.ReadFile("deploy.nix")
+	fmt.Printf("reading deploy.nix from: %s\n", deployFilePath)
+	data, err := ioutil.ReadFile(deployFilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +186,13 @@ func main() {
 	username := os.Getenv("USER")
 	parallelism := 1
 	subcommand := ""
+	// if deployFilePath == "" {
+	// 	deployFilePath = "deploy.nix" // Default path
+	// }
 	flag.StringVar(&filter, "on", filter, "Set the filter to apply (default: .*)")
 	flag.StringVar(&username, "l", username, "Specify the username for the target host (default: current user)")
 	flag.IntVar(&parallelism, "P", parallelism, "Specify the number of parallel jobs (default: 1)")
+	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset (default: builtin)")
 	help := flag.Bool("h", false, "Display this help message")
 	flag.Parse()
 
