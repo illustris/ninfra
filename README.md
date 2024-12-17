@@ -7,7 +7,6 @@
 - Execute arbitrary commands on multiple hosts via SSH.
 - Apply NixOS rebuild actions (`switch`, `boot`, `test`, etc.) with parallelism.
 - Filter hosts using regular expressions.
-- Dynamic configuration file lookup with build-time path specification.
 
 ## Usage
 

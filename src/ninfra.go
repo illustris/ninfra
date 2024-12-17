@@ -14,26 +14,6 @@ import (
 
 type Configurations map[string]string
 
-func printHelp() {
-	fmt.Println(`Usage: <subcommand> [options] [arguments]
-
-Subcommands:
-  exec               Execute a command on the specified hosts
-  apply              Perform nixos-rebuild on the specified hosts
-
-Options:
-  --on <filter>       Set the filter to apply (default: .*)
-  -l <username>       Specify the username for the target host (default: current user)
-  -P <parallelism>    Specify the number of parallel jobs (default: 1)
-  -d <deploy.nix>     Use a custom nix expression file to generate the target and config attrset (default: builtin)
-  -h, --help          Display this help message
-
-Arguments:
-  For exec: Any command to execute on the target hosts
-  For apply: An optional positional argument to specify the action (default: switch).
-`)
-}
-
 var deployFilePath = "default.nix"
 
 func parseConfigurations() (Configurations, error) {
@@ -183,18 +163,18 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 }
 
 func main() {
+	// make help text cleaner
+	os.Args[0] = "ninfra"
 	filter := ".*"
 	username := os.Getenv("USER")
 	parallelism := 1
 	subcommand := ""
-	// if deployFilePath == "" {
-	// 	deployFilePath = "deploy.nix" // Default path
-	// }
-	flag.StringVar(&filter, "on", filter, "Set the filter to apply (default: .*)")
-	flag.StringVar(&username, "l", username, "Specify the username for the target host (default: current user)")
-	flag.IntVar(&parallelism, "P", parallelism, "Specify the number of parallel jobs (default: 1)")
-	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset (default: builtin)")
-	help := flag.Bool("h", false, "Display this help message")
+
+	flag.StringVar(&filter, "on", filter, "Set the filter to apply")
+	flag.StringVar(&username, "l", username, "Specify the username for the target host")
+	flag.IntVar(&parallelism, "P", parallelism, "Specify the number of parallel jobs")
+	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset")
+	// flag.StringVar(&filter, "on", filter, "Set the filter to apply")
 	flag.Parse()
 
 	args := flag.Args()
@@ -202,13 +182,9 @@ func main() {
 		subcommand = args[0]
 	}
 
-	if *help || subcommand == "" {
-		printHelp()
-		os.Exit(0)
-	}
-
 	configs, err := parseConfigurations()
 	if err != nil {
+		flag.Usage()
 		fmt.Printf("Error parsing configurations: %s\n", err)
 		os.Exit(1)
 	}
@@ -228,7 +204,7 @@ func main() {
 
 	default:
 		fmt.Printf("Error: Unknown subcommand '%s'.\n", subcommand)
-		printHelp()
+		flag.Usage()
 		os.Exit(1)
 	}
 }
