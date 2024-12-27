@@ -15,6 +15,8 @@ import (
 type Configurations map[string]string
 
 var deployFilePath = "default.nix"
+var skipBuild = false
+var trustNewKeys = true
 
 func parseConfigurations() (Configurations, error) {
 	fmt.Printf("reading deploy.nix from: %s\n", deployFilePath)
@@ -121,6 +123,9 @@ func filterConfigurations(configs Configurations, filter string) Configurations 
 func sshAction(host, address string, args []string, username string) *exec.Cmd {
 	sshTgt := fmt.Sprintf("%s@%s", username, address)
 	childArgs := append([]string{sshTgt, "--"}, args...)
+	if trustNewKeys {
+		childArgs = append([]string{"-o", "StrictHostKeyChecking=accept-new"}, childArgs...)
+	}
 	return exec.Command("ssh", childArgs...)
 }
 
@@ -140,10 +145,14 @@ func nixosBuildAction(host, address string, args []string, username string) *exe
 }
 
 func applyWithBuild(configs Configurations, args []string, username string, parallelism int) {
-	fmt.Println("Starting build phase on all nodes...")
-	if err := executeConcurrently(configs, nil, username, parallelism, nixosBuildAction); err != nil {
-		fmt.Println("Build phase failed. Aborting apply phase.")
-		os.Exit(1)
+	if skipBuild {
+		fmt.Println("Skipping build phase due to --fast flag.")
+	} else {
+		fmt.Println("Starting build phase on all nodes...")
+		if err := executeConcurrently(configs, nil, username, parallelism, nixosBuildAction); err != nil {
+			fmt.Println("Build phase failed. Aborting apply phase.")
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("Build phase succeeded. Starting apply phase...")
@@ -174,8 +183,14 @@ func main() {
 	flag.StringVar(&username, "l", username, "Specify the username for the target host")
 	flag.IntVar(&parallelism, "P", parallelism, "Specify the number of parallel jobs")
 	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset")
-	// flag.StringVar(&filter, "on", filter, "Set the filter to apply")
+	flag.BoolVar(&skipBuild, "fast", false, "Skip the initial build phase")
+	flag.BoolVar(&trustNewKeys, "trust-new-keys", true, "Automatically trust new server keys")
 	flag.Parse()
+
+	// Set environment variable for SSH options if trustNewKeys is enabled
+	if trustNewKeys {
+		os.Setenv("NIX_SSHOPTS", "-o StrictHostKeyChecking=accept-new")
+	}
 
 	args := flag.Args()
 	if len(args) > 0 {
