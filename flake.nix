@@ -12,7 +12,7 @@
 					src = ./src;
 					vendorHash = null;
 					ldflags = [ "-X main.deployFilePath=${copyPathToStore ./src/deploy.nix}" ];
-					CGO_ENABLED = 0;
+					env.CGO_ENABLED = 0;
 				}
 			) {};
 			default = ninfra;
