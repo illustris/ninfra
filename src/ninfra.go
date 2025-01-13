@@ -174,6 +174,7 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 func main() {
 	// make help text cleaner
 	os.Args[0] = "ninfra"
+
 	filter := ".*"
 	username := os.Getenv("USER")
 	parallelism := 1
@@ -185,6 +186,26 @@ func main() {
 	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset")
 	flag.BoolVar(&skipBuild, "fast", false, "Skip the initial build phase")
 	flag.BoolVar(&trustNewKeys, "trust-new-keys", true, "Automatically trust new server keys")
+
+	// Customize the help output
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s <subcommand> [options] [arguments]
+
+Subcommands:
+  exec               Execute a command on the specified hosts
+  apply              Perform nixos-rebuild on the specified hosts
+
+Options:
+`, os.Args[0])
+		flag.PrintDefaults() // Prints all defined flags with their descriptions
+
+		fmt.Fprintln(os.Stderr, `
+Arguments:
+  For exec: Any command to execute on the target hosts
+  For apply: An optional positional argument to specify the action (default: switch).
+`)
+	}
+
 	flag.Parse()
 
 	// Set environment variable for SSH options if trustNewKeys is enabled
