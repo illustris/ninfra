@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"bufio"
 	"regexp"
 	"sync"
 )
@@ -17,6 +17,7 @@ type Configurations map[string]string
 var deployFilePath = "default.nix"
 var skipBuild = false
 var trustNewKeys = true
+var useSubstitutes = true
 
 func parseConfigurations() (Configurations, error) {
 	fmt.Printf("reading deploy.nix from: %s\n", deployFilePath)
@@ -45,18 +46,41 @@ func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 		return fmt.Errorf("%s: Failed to get stdout pipe: %w", host, err)
 	}
 
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("%s: Failed to get stderr pipe: %w", host, err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("%s: Failed to start command: %w", host, err)
 	}
 
-	scanner := bufio.NewScanner(stdoutPipe)
-	for scanner.Scan() {
-		fmt.Printf("%s: %s\n", host, scanner.Text())
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("%s: Error reading output: %w", host, err)
-	}
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			fmt.Printf("%s: %s\n", host, scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("%s: Error reading stdout: %v\n", host, err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			fmt.Printf("%s (stderr): %s\n", host, scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("%s: Error reading stderr: %v\n", host, err)
+		}
+	}()
+
+	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("%s: Command finished with error: %w", host, err)
@@ -72,11 +96,11 @@ func executeConcurrently(configs map[string]string, args []string, username stri
 
 	for host, address := range configs {
 		wg.Add(1)
-		semaphore <- struct{}{} // Acquire a slot
+		semaphore <- struct{}{}
 
 		go func(host, address string) {
 			defer wg.Done()
-			defer func() { <-semaphore }() // Release the slot
+			defer func() { <-semaphore }()
 
 			cmd := action(host, address, args, username)
 			if cmd == nil {
@@ -90,7 +114,7 @@ func executeConcurrently(configs map[string]string, args []string, username stri
 		}(host, address)
 	}
 
-	wg.Wait() // Wait for all goroutines to finish
+	wg.Wait()
 	close(errors)
 
 	if len(errors) > 0 {
@@ -111,11 +135,14 @@ func filterConfigurations(configs Configurations, filter string) Configurations 
 		os.Exit(1)
 	}
 
+	fmt.Printf("----\nselected hosts:\n")
 	for host, address := range configs {
 		if re.MatchString(host) {
 			filteredConfigs[host] = address
+			fmt.Printf("%s -> %s\n", host, address)
 		}
 	}
+	fmt.Printf("----\n")
 
 	return filteredConfigs
 }
@@ -133,15 +160,27 @@ func nixosRebuildAction(host, address string, args []string, username string) *e
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTgt := fmt.Sprintf("%s@%s", username, address)
 	if len(args) == 0 {
-		args = []string{"switch"} // Default action
+		args = []string{"switch"}
 	}
-	return exec.Command("nixos-rebuild", args[0], "--flake", hostAttr, "--target-host", sshTgt)
+
+	// Build the command arguments, injecting --use-substitutes if enabled.
+	cmdArgs := []string{args[0]}
+	if useSubstitutes {
+		cmdArgs = append(cmdArgs, "--use-substitutes")
+	}
+	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTgt)
+	return exec.Command("nixos-rebuild", cmdArgs...)
 }
 
 func nixosBuildAction(host, address string, args []string, username string) *exec.Cmd {
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTgt := fmt.Sprintf("%s@%s", username, address)
-	return exec.Command("nixos-rebuild", "build", "--flake", hostAttr, "--target-host", sshTgt)
+	cmdArgs := []string{"build"}
+	if useSubstitutes {
+		cmdArgs = append(cmdArgs, "--use-substitutes")
+	}
+	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTgt)
+	return exec.Command("nixos-rebuild", cmdArgs...)
 }
 
 func applyWithBuild(configs Configurations, args []string, username string, parallelism int) {
@@ -186,6 +225,7 @@ func main() {
 	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset")
 	flag.BoolVar(&skipBuild, "fast", false, "Skip the initial build phase")
 	flag.BoolVar(&trustNewKeys, "trust-new-keys", true, "Automatically trust new server keys")
+	flag.BoolVar(&useSubstitutes, "use-substitutes", useSubstitutes, "Automatically use substitutes when rebuilding")
 
 	// Customize the help output
 	flag.Usage = func() {
@@ -197,7 +237,7 @@ Subcommands:
 
 Options:
 `, os.Args[0])
-		flag.PrintDefaults() // Prints all defined flags with their descriptions
+		flag.PrintDefaults()
 
 		fmt.Fprintln(os.Stderr, `
 Arguments:
@@ -208,7 +248,6 @@ Arguments:
 
 	flag.Parse()
 
-	// Set environment variable for SSH options if trustNewKeys is enabled
 	if trustNewKeys {
 		os.Setenv("NIX_SSHOPTS", "-o StrictHostKeyChecking=accept-new")
 	}
