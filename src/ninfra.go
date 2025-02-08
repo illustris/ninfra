@@ -9,15 +9,22 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 )
 
-type Configurations map[string]string
+type HostConfig struct {
+	IP   string `json:"ip"`
+	Path string `json:"path"`
+}
+
+type Configurations map[string]HostConfig
 
 var deployFilePath = "default.nix"
 var skipBuild = false
 var trustNewKeys = true
 var useSubstitutes = true
+var verbose = false
 
 func parseConfigurations() (Configurations, error) {
 	fmt.Printf("reading deploy.nix from: %s\n", deployFilePath)
@@ -89,20 +96,20 @@ func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 	return nil
 }
 
-func executeConcurrently(configs map[string]string, args []string, username string, parallelism int, action ActionFunc) error {
+func executeConcurrently(configs Configurations, args []string, username string, parallelism int, action ActionFunc) error {
 	semaphore := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
 	errors := make(chan error, len(configs))
 
-	for host, address := range configs {
+	for host, cfg := range configs {
 		wg.Add(1)
 		semaphore <- struct{}{}
 
-		go func(host, address string) {
+		go func(host string, cfg HostConfig) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
 
-			cmd := action(host, address, args, username)
+			cmd := action(host, cfg.IP, args, username)
 			if cmd == nil {
 				fmt.Printf("%s: Skipping due to nil command\n", host)
 				return
@@ -111,7 +118,7 @@ func executeConcurrently(configs map[string]string, args []string, username stri
 			if err := executeAndStreamOutput(host, cmd); err != nil {
 				errors <- fmt.Errorf("%s: %w", host, err)
 			}
-		}(host, address)
+		}(host, cfg)
 	}
 
 	wg.Wait()
@@ -136,10 +143,10 @@ func filterConfigurations(configs Configurations, filter string) Configurations 
 	}
 
 	fmt.Printf("----\nselected hosts:\n")
-	for host, address := range configs {
+	for host, cfg := range configs {
 		if re.MatchString(host) {
-			filteredConfigs[host] = address
-			fmt.Printf("%s -> %s\n", host, address)
+			filteredConfigs[host] = cfg
+			fmt.Printf("%s -> %+v\n", host, cfg)
 		}
 	}
 	fmt.Printf("----\n")
@@ -210,6 +217,131 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 	}
 }
 
+// compareAction returns an *exec.Cmd that SSHes into the target host and
+// runs a command to get the real (symlink-resolved) paths for /run/current-system and /nix/var/nix/profiles/system.
+func compareAction(host, address string, args []string, username string) *exec.Cmd {
+	sshTgt := fmt.Sprintf("%s@%s", username, address)
+	// The remote shell prints the resolved paths.
+	childArgs := []string{}
+	if trustNewKeys {
+		childArgs = append(childArgs, "-o", "StrictHostKeyChecking=accept-new")
+	}
+	childArgs = append(childArgs, sshTgt, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
+	return exec.Command("ssh", childArgs...)
+}
+
+// compareResult holds the comparison result from a host.
+type compareResult struct {
+	host          string
+	expected      string
+	currentSystem string
+	systemProfile string
+	err           error
+}
+
+// getCompareResults runs compareAction on each host concurrently, collects the results,
+// and returns a slice of compareResult.
+func getCompareResults(configs Configurations, username string, parallelism int) []compareResult {
+	semaphore := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	resultsChan := make(chan compareResult, len(configs))
+
+	for host, cfg := range configs {
+		wg.Add(1)
+		semaphore <- struct{}{}
+
+		go func(host string, cfg HostConfig) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			cmd := compareAction(host, cfg.IP, nil, username)
+			output, err := cmd.CombinedOutput()
+			res := compareResult{
+				host:     host,
+				expected: cfg.Path,
+			}
+			if err != nil {
+				res.err = fmt.Errorf("error executing SSH command: %w, output: %s", err, string(output))
+				resultsChan <- res
+				return
+			}
+
+			outStr := string(output)
+			lines := strings.Split(outStr, "\n")
+			res.currentSystem = strings.TrimSpace(lines[0])
+			res.systemProfile = strings.TrimSpace(lines[1])
+			resultsChan <- res
+		}(host, cfg)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	var results []compareResult
+	for r := range resultsChan {
+		results = append(results, r)
+	}
+	return results
+}
+
+// printCompareVerbose prints a detailed report for each host.
+func printCompareVerbose(results []compareResult) int {
+	mismatches := 0
+	fmt.Println("==== Compare Report ====")
+	for _, res := range results {
+		fmt.Printf("Host: %s\n", res.host)
+		if res.err != nil {
+			fmt.Printf("  Error: %v\n", res.err)
+			mismatches++
+		} else {
+			fmt.Printf("  Expected path: %s\n", res.expected)
+			csStatus := "MATCH"
+			spStatus := "MATCH"
+			if res.currentSystem != res.expected {
+				csStatus = "MISMATCH"
+			}
+			if res.systemProfile != res.expected {
+				spStatus = "MISMATCH"
+			}
+			fmt.Printf("  /run/current-system: %s (%s)\n", res.currentSystem, csStatus)
+			fmt.Printf("  /nix/var/nix/profiles/system: %s (%s)\n", res.systemProfile, spStatus)
+			if csStatus == "MISMATCH" || spStatus == "MISMATCH" {
+				mismatches++
+			}
+		}
+		fmt.Println("----")
+	}
+	return mismatches
+}
+
+// printCompareTable prints a summary table. For each host, it shows "Y" if the active (/run/current-system)
+// or boot (/nix/var/nix/profiles/system) paths match the expected value, and "N" otherwise.
+func printCompareTable(results []compareResult) int {
+	mismatches := 0
+	// Print header.
+	fmt.Printf("%-20s %-7s %-7s %-7s\n", "HOST", "ACTIVE", "BOOT", "PERSISTED")
+	for _, res := range results {
+		// var active, boot, persisted string
+		active := "N"
+		boot := "N"
+		persisted := "N"
+		if res.currentSystem == res.expected {
+			active = "Y"
+		}
+		if res.systemProfile == res.expected {
+			boot = "Y"
+		}
+		if !(res.currentSystem == res.expected && res.systemProfile == res.expected) {
+			mismatches++
+		}
+		if res.currentSystem == res.systemProfile {
+			persisted = "Y"
+		}
+		fmt.Printf("%-20s %-7s %-7s %-7s\n", res.host, active, boot, persisted)
+	}
+	return mismatches
+}
+
 func main() {
 	// make help text cleaner
 	os.Args[0] = "ninfra"
@@ -226,6 +358,7 @@ func main() {
 	flag.BoolVar(&skipBuild, "fast", false, "Skip the initial build phase")
 	flag.BoolVar(&trustNewKeys, "trust-new-keys", true, "Automatically trust new server keys")
 	flag.BoolVar(&useSubstitutes, "use-substitutes", useSubstitutes, "Automatically use substitutes when rebuilding")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose output for compare subcommand")
 
 	// Customize the help output
 	flag.Usage = func() {
@@ -234,6 +367,7 @@ func main() {
 Subcommands:
   exec               Execute a command on the specified hosts
   apply              Perform nixos-rebuild on the specified hosts
+  compare            Compare resolved system paths with the configured path
 
 Options:
 `, os.Args[0])
@@ -243,6 +377,7 @@ Options:
 Arguments:
   For exec: Any command to execute on the target hosts
   For apply: An optional positional argument to specify the action (default: switch).
+  For compare: No additional arguments required.
 `)
 	}
 
@@ -276,6 +411,19 @@ Arguments:
 
 	case "apply":
 		applyWithBuild(filteredConfigs, args[1:], username, parallelism)
+
+	case "compare":
+		results := getCompareResults(filteredConfigs, username, parallelism)
+		var mismatches int
+		if verbose {
+			mismatches = printCompareVerbose(results)
+		} else {
+			mismatches = printCompareTable(results)
+		}
+		if mismatches > 0 {
+			fmt.Printf("\nFound %d host(s) with mismatches/errors.\n", mismatches)
+			os.Exit(1)
+		}
 
 	default:
 		fmt.Printf("Error: Unknown subcommand '%s'.\n", subcommand)
