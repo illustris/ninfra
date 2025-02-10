@@ -1,5 +1,8 @@
 {
-	description = "A very basic flake";
+	description = "ninfra: an opinionated nixos infra management tool";
+	inputs = {
+		nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+	};
 	outputs = { self, nixpkgs }: {
 		packages.x86_64-linux = rec {
 			ninfra = with nixpkgs.legacyPackages.x86_64-linux; callPackage (

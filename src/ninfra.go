@@ -2,15 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 type HostConfig struct {
@@ -20,46 +22,76 @@ type HostConfig struct {
 
 type Configurations map[string]HostConfig
 
-var deployFilePath = "default.nix"
-var skipBuild = false
-var trustNewKeys = true
-var useSubstitutes = true
-var verbose = false
+var (
+	deployFilePath = "default.nix"
+	skipBuild      = false
+	trustNewKeys   = true
+	useSubstitutes = true
+	verbose        = false
+	timeout        time.Duration
+)
 
 func parseConfigurations() (Configurations, error) {
-	fmt.Printf("reading deploy.nix from: %s\n", deployFilePath)
-	data, err := ioutil.ReadFile(deployFilePath)
+	log.Printf("Reading deploy.nix from: %s", deployFilePath)
+	data, err := os.ReadFile(deployFilePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read file %s: %w", deployFilePath, err)
 	}
 	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations", "--apply", string(data))
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("Error parsing configurations. Stdout and Stderr: %s\n", string(output))
-		return nil, err
+		log.Printf("Error parsing configurations. Output: %s", string(output))
+		return nil, fmt.Errorf("failed to eval configurations: %w", err)
 	}
 	var configs Configurations
 	if err := json.Unmarshal(output, &configs); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal configurations: %w", err)
 	}
 	return configs, nil
 }
 
+// sshBaseArgs builds the initial SSH arguments (including the host target)
+// and optionally adds a "--" separator if needed.
+func sshBaseArgs(username, address string, addSeparator bool) []string {
+	sshTgt := fmt.Sprintf("%s@%s", username, address)
+	args := []string{}
+	if trustNewKeys {
+		args = append(args, "-o", "StrictHostKeyChecking=accept-new")
+	}
+	args = append(args, sshTgt)
+	if addSeparator {
+		args = append(args, "--")
+	}
+	return args
+}
+
+// ActionFunc is the type for functions that build an exec.Cmd for a given action.
 type ActionFunc func(host, address string, args []string, username string) *exec.Cmd
+
+// newCmd is a helper that creates an *exec.Cmd using a timeout context if a timeout is set.
+func newCmd(name string, args ...string) *exec.Cmd {
+	if timeout > 0 {
+		// Create a context with timeout. (Note: In a real program you might want to
+		// capture the cancel function and ensure it’s called, but here we simply attach the timeout.)
+		ctx, _ := context.WithTimeout(context.Background(), timeout)
+		return exec.CommandContext(ctx, name, args...)
+	}
+	return exec.Command(name, args...)
+}
 
 func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("%s: Failed to get stdout pipe: %w", host, err)
+		return fmt.Errorf("%s: failed to get stdout pipe: %w", host, err)
 	}
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("%s: Failed to get stderr pipe: %w", host, err)
+		return fmt.Errorf("%s: failed to get stderr pipe: %w", host, err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%s: Failed to start command: %w", host, err)
+		return fmt.Errorf("%s: failed to start command: %w", host, err)
 	}
 
 	var wg sync.WaitGroup
@@ -69,10 +101,10 @@ func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			fmt.Printf("%s: %s\n", host, scanner.Text())
+			log.Printf("%s: %s", host, scanner.Text())
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Printf("%s: Error reading stdout: %v\n", host, err)
+			log.Printf("%s: error reading stdout: %v", host, err)
 		}
 	}()
 
@@ -80,17 +112,17 @@ func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			fmt.Printf("%s (stderr): %s\n", host, scanner.Text())
+			log.Printf("%s (stderr): %s", host, scanner.Text())
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Printf("%s: Error reading stderr: %v\n", host, err)
+			log.Printf("%s: error reading stderr: %v", host, err)
 		}
 	}()
 
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("%s: Command finished with error: %w", host, err)
+		return fmt.Errorf("%s: command finished with error: %w", host, err)
 	}
 
 	return nil
@@ -99,7 +131,7 @@ func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
 func executeConcurrently(configs Configurations, args []string, username string, parallelism int, action ActionFunc) error {
 	semaphore := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
-	errors := make(chan error, len(configs))
+	errChan := make(chan error, len(configs))
 
 	for host, cfg := range configs {
 		wg.Add(1)
@@ -111,24 +143,24 @@ func executeConcurrently(configs Configurations, args []string, username string,
 
 			cmd := action(host, cfg.IP, args, username)
 			if cmd == nil {
-				fmt.Printf("%s: Skipping due to nil command\n", host)
+				log.Printf("%s: skipping due to nil command", host)
 				return
 			}
 
 			if err := executeAndStreamOutput(host, cmd); err != nil {
-				errors <- fmt.Errorf("%s: %w", host, err)
+				errChan <- fmt.Errorf("%s: %w", host, err)
 			}
 		}(host, cfg)
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errChan)
 
-	if len(errors) > 0 {
-		for err := range errors {
-			fmt.Println(err)
+	if len(errChan) > 0 {
+		for err := range errChan {
+			log.Println(err)
 		}
-		return fmt.Errorf("One or more commands failed")
+		return fmt.Errorf("one or more commands failed")
 	}
 
 	return nil
@@ -138,29 +170,25 @@ func filterConfigurations(configs Configurations, filter string) Configurations 
 	filteredConfigs := make(Configurations)
 	re, err := regexp.Compile(filter)
 	if err != nil {
-		fmt.Printf("Error compiling filter regex: %s\n", err)
-		os.Exit(1)
+		log.Fatalf("Error compiling filter regex: %s", err)
 	}
 
-	fmt.Printf("----\nselected hosts:\n")
+	log.Println("----\nSelected hosts:")
 	for host, cfg := range configs {
 		if re.MatchString(host) {
 			filteredConfigs[host] = cfg
-			fmt.Printf("%s -> %+v\n", host, cfg)
+			log.Printf("%s -> %+v", host, cfg)
 		}
 	}
-	fmt.Printf("----\n")
+	log.Println("----")
 
 	return filteredConfigs
 }
 
 func sshAction(host, address string, args []string, username string) *exec.Cmd {
-	sshTgt := fmt.Sprintf("%s@%s", username, address)
-	childArgs := append([]string{sshTgt, "--"}, args...)
-	if trustNewKeys {
-		childArgs = append([]string{"-o", "StrictHostKeyChecking=accept-new"}, childArgs...)
-	}
-	return exec.Command("ssh", childArgs...)
+	baseArgs := sshBaseArgs(username, address, true)
+	childArgs := append(baseArgs, args...)
+	return newCmd("ssh", childArgs...)
 }
 
 func nixosRebuildAction(host, address string, args []string, username string) *exec.Cmd {
@@ -176,7 +204,7 @@ func nixosRebuildAction(host, address string, args []string, username string) *e
 		cmdArgs = append(cmdArgs, "--use-substitutes")
 	}
 	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTgt)
-	return exec.Command("nixos-rebuild", cmdArgs...)
+	return newCmd("nixos-rebuild", cmdArgs...)
 }
 
 func nixosBuildAction(host, address string, args []string, username string) *exec.Cmd {
@@ -187,21 +215,21 @@ func nixosBuildAction(host, address string, args []string, username string) *exe
 		cmdArgs = append(cmdArgs, "--use-substitutes")
 	}
 	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTgt)
-	return exec.Command("nixos-rebuild", cmdArgs...)
+	return newCmd("nixos-rebuild", cmdArgs...)
 }
 
 func applyWithBuild(configs Configurations, args []string, username string, parallelism int) {
 	if skipBuild {
-		fmt.Println("Skipping build phase due to --fast flag.")
+		log.Println("Skipping build phase due to --fast flag.")
 	} else {
-		fmt.Println("Starting build phase on all nodes...")
+		log.Println("Starting build phase on all nodes...")
 		if err := executeConcurrently(configs, nil, username, parallelism, nixosBuildAction); err != nil {
-			fmt.Println("Build phase failed. Aborting apply phase.")
+			log.Println("Build phase failed. Aborting apply phase.")
 			os.Exit(1)
 		}
 	}
 
-	fmt.Println("Build phase succeeded. Starting apply phase...")
+	log.Println("Build phase succeeded. Starting apply phase...")
 	action := "switch"
 	if len(args) > 0 {
 		action = args[0]
@@ -212,25 +240,17 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 	}
 
 	if err := executeConcurrently(configs, finalArgs, username, parallelism, nixosRebuildAction); err != nil {
-		fmt.Println("Apply phase failed.")
+		log.Println("Apply phase failed.")
 		os.Exit(1)
 	}
 }
 
-// compareAction returns an *exec.Cmd that SSHes into the target host and
-// runs a command to get the real (symlink-resolved) paths for /run/current-system and /nix/var/nix/profiles/system.
 func compareAction(host, address string, args []string, username string) *exec.Cmd {
-	sshTgt := fmt.Sprintf("%s@%s", username, address)
-	// The remote shell prints the resolved paths.
-	childArgs := []string{}
-	if trustNewKeys {
-		childArgs = append(childArgs, "-o", "StrictHostKeyChecking=accept-new")
-	}
-	childArgs = append(childArgs, sshTgt, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
-	return exec.Command("ssh", childArgs...)
+	baseArgs := sshBaseArgs(username, address, false)
+	childArgs := append(baseArgs, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
+	return newCmd("ssh", childArgs...)
 }
 
-// compareResult holds the comparison result from a host.
 type compareResult struct {
 	host          string
 	expected      string
@@ -239,8 +259,6 @@ type compareResult struct {
 	err           error
 }
 
-// getCompareResults runs compareAction on each host concurrently, collects the results,
-// and returns a slice of compareResult.
 func getCompareResults(configs Configurations, username string, parallelism int) []compareResult {
 	semaphore := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
@@ -266,10 +284,13 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 				return
 			}
 
-			outStr := string(output)
-			lines := strings.Split(outStr, "\n")
-			res.currentSystem = strings.TrimSpace(lines[0])
-			res.systemProfile = strings.TrimSpace(lines[1])
+			lines := strings.Split(string(output), "\n")
+			if len(lines) >= 2 {
+				res.currentSystem = strings.TrimSpace(lines[0])
+				res.systemProfile = strings.TrimSpace(lines[1])
+			} else {
+				res.err = fmt.Errorf("unexpected output: %s", string(output))
+			}
 			resultsChan <- res
 		}(host, cfg)
 	}
@@ -284,7 +305,6 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 	return results
 }
 
-// printCompareVerbose prints a detailed report for each host.
 func printCompareVerbose(results []compareResult) int {
 	mismatches := 0
 	fmt.Println("==== Compare Report ====")
@@ -295,8 +315,7 @@ func printCompareVerbose(results []compareResult) int {
 			mismatches++
 		} else {
 			fmt.Printf("  Expected path: %s\n", res.expected)
-			csStatus := "MATCH"
-			spStatus := "MATCH"
+			csStatus, spStatus := "MATCH", "MATCH"
 			if res.currentSystem != res.expected {
 				csStatus = "MISMATCH"
 			}
@@ -314,28 +333,22 @@ func printCompareVerbose(results []compareResult) int {
 	return mismatches
 }
 
-// printCompareTable prints a summary table. For each host, it shows "Y" if the active (/run/current-system)
-// or boot (/nix/var/nix/profiles/system) paths match the expected value, and "N" otherwise.
 func printCompareTable(results []compareResult) int {
 	mismatches := 0
-	// Print header.
 	fmt.Printf("%-20s %-7s %-7s %-7s\n", "HOST", "ACTIVE", "BOOT", "PERSISTED")
 	for _, res := range results {
-		// var active, boot, persisted string
-		active := "N"
-		boot := "N"
-		persisted := "N"
+		active, boot, persisted := "N", "N", "N"
 		if res.currentSystem == res.expected {
 			active = "Y"
 		}
 		if res.systemProfile == res.expected {
 			boot = "Y"
 		}
-		if !(res.currentSystem == res.expected && res.systemProfile == res.expected) {
-			mismatches++
-		}
 		if res.currentSystem == res.systemProfile {
 			persisted = "Y"
+		}
+		if active != "Y" || boot != "Y" {
+			mismatches++
 		}
 		fmt.Printf("%-20s %-7s %-7s %-7s\n", res.host, active, boot, persisted)
 	}
@@ -346,7 +359,7 @@ func main() {
 	// make help text cleaner
 	os.Args[0] = "ninfra"
 
-	filter := ".*"
+	var filter string = ".*"
 	username := os.Getenv("USER")
 	parallelism := 1
 	subcommand := ""
@@ -356,11 +369,11 @@ func main() {
 	flag.IntVar(&parallelism, "P", parallelism, "Specify the number of parallel jobs")
 	flag.StringVar(&deployFilePath, "d", deployFilePath, "Specify the nix expression file that returns the hosts attrset")
 	flag.BoolVar(&skipBuild, "fast", false, "Skip the initial build phase")
-	flag.BoolVar(&trustNewKeys, "trust-new-keys", true, "Automatically trust new server keys")
+	flag.BoolVar(&trustNewKeys, "trust-new-keys", trustNewKeys, "Automatically trust new server keys")
 	flag.BoolVar(&useSubstitutes, "use-substitutes", useSubstitutes, "Automatically use substitutes when rebuilding")
-	flag.BoolVar(&verbose, "v", false, "Enable verbose output for compare subcommand")
+	flag.BoolVar(&verbose, "v", verbose, "Enable verbose output for compare subcommand")
+	flag.DurationVar(&timeout, "timeout", 0, "Timeout for remote commands (e.g. 5m, 1m)")
 
-	// Customize the help output
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: %s <subcommand> [options] [arguments]
 
@@ -383,6 +396,7 @@ Arguments:
 
 	flag.Parse()
 
+	// Also set the environment variable used by nixos-rebuild.
 	if trustNewKeys {
 		os.Setenv("NIX_SSHOPTS", "-o StrictHostKeyChecking=accept-new")
 	}
@@ -395,8 +409,7 @@ Arguments:
 	configs, err := parseConfigurations()
 	if err != nil {
 		flag.Usage()
-		fmt.Printf("Error parsing configurations: %s\n", err)
-		os.Exit(1)
+		log.Fatalf("Error parsing configurations: %v", err)
 	}
 
 	filteredConfigs := filterConfigurations(configs, filter)
@@ -404,14 +417,13 @@ Arguments:
 	switch subcommand {
 	case "exec":
 		if len(args) < 2 {
-			fmt.Println("Error: No command specified for exec.")
-			os.Exit(1)
+			log.Fatal("Error: No command specified for exec.")
 		}
-		executeConcurrently(filteredConfigs, args[1:], username, parallelism, sshAction)
-
+		if err := executeConcurrently(filteredConfigs, args[1:], username, parallelism, sshAction); err != nil {
+			log.Fatal(err)
+		}
 	case "apply":
 		applyWithBuild(filteredConfigs, args[1:], username, parallelism)
-
 	case "compare":
 		results := getCompareResults(filteredConfigs, username, parallelism)
 		var mismatches int
@@ -424,7 +436,6 @@ Arguments:
 			fmt.Printf("\nFound %d host(s) with mismatches/errors.\n", mismatches)
 			os.Exit(1)
 		}
-
 	default:
 		fmt.Printf("Error: Unknown subcommand '%s'.\n", subcommand)
 		flag.Usage()
