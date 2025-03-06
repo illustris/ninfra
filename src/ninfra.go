@@ -16,57 +16,269 @@ import (
 	"time"
 )
 
+type DeploymentInfo struct {
+	TargetHost string `json:"targetHost"`
+}
+
 type HostConfig struct {
-	IP   string `json:"ip"`
-	Path string `json:"path"`
+	Deployment DeploymentInfo `json:"deployment"`
+	Path       string         `json:"path,omitempty"`
 }
 
 type Configurations map[string]HostConfig
 
-var DeployFilePath = "default.nix"
+// Default Nix expressions
+var (
+	// Expression to list all hosts from nixosConfigurations
+	DefaultListHostsExpr = "builtins.attrNames"
+
+	// Expression to get deployment info for a specific host
+	DefaultDeploymentExpr = "cfg: { targetHost = cfg.config.deployment.targetHost or cfg.config.passthru.deployment.targetHost or null; }"
+
+	// Expression to get system path for a specific host
+	DefaultClosurePathExpr = "cfg: cfg.config.system.build.toplevel.outPath"
+)
 
 // Options contains configuration flags and settings.
 type Options struct {
-	DeployFilePath string
-	SkipBuild      bool
-	TrustNewKeys   bool
-	UseSubstitutes bool
-	Verbose        bool
-	Timeout        time.Duration
-	Username       string
-	Parallelism    int
-	Filter         string
+	ListHostsExpr     string
+	DeploymentExpr    string
+	ClosurePathExpr   string
+	SkipBuild         bool
+	TrustNewKeys      bool
+	UseSubstitutes    bool
+	Verbose           bool
+	Timeout           time.Duration
+	Username          string
+	Parallelism       int
+	Filter            string
 }
 
 var opts Options
 
-// parseConfigurations reads and evaluates the Nix expression file to get host configurations.
-func parseConfigurations(deployFilePath string) (Configurations, error) {
-	log.Printf("Reading deploy.nix from: %s", deployFilePath)
-	data, err := os.ReadFile(deployFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file %s: %w", deployFilePath, err)
-	}
+// getHostsList returns a list of all host names in the flake.
+func getHostsList() ([]string, error) {
+	log.Printf("Getting list of hosts...")
 
-	// Evaluate the nix expression.
-	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations", "--apply", string(data))
+	// Build command to get all hosts by name only (lightweight)
+	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations", "--apply", opts.ListHostsExpr)
 
-	// Capture stdout and stderr separately.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("Error parsing configurations. Stdout: %s", stdout.String())
-		log.Printf("Error parsing configurations. Stderr: %s", stderr.String())
-		return nil, fmt.Errorf("failed to eval configurations: %w", err)
+		log.Printf("Error getting hosts list. Stdout: %s", stdout.String())
+		log.Printf("Error getting hosts list. Stderr: %s", stderr.String())
+		return nil, fmt.Errorf("failed to get hosts list: %w", err)
 	}
 
-	var configs Configurations
-	if err := json.Unmarshal(stdout.Bytes(), &configs); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal configurations: %w", err)
+	var hosts []string
+	if err := json.Unmarshal(stdout.Bytes(), &hosts); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal hosts list: %w", err)
 	}
+
+	return hosts, nil
+}
+
+// getHostDeploymentInfo gets deployment information for a specific host
+func getHostDeploymentInfo(host string) (DeploymentInfo, error) {
+	var deploymentInfo DeploymentInfo
+
+	cmd := exec.Command("nix", "eval", "--json",
+		fmt.Sprintf(".#nixosConfigurations.%s", host),
+		"--apply", opts.DeploymentExpr)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return deploymentInfo, fmt.Errorf("error evaluating deployment info for %s: %w (stderr: %s)",
+			host, err, stderr.String())
+	}
+
+	if err := json.Unmarshal(stdout.Bytes(), &deploymentInfo); err != nil {
+		return deploymentInfo, fmt.Errorf("failed to unmarshal deployment info for %s: %w", host, err)
+	}
+
+	return deploymentInfo, nil
+}
+
+// getHostClosurePath gets the system path for a specific host
+func getHostClosurePath(host string) (string, error) {
+	var path string
+
+	cmd := exec.Command("nix", "eval", "--json",
+		fmt.Sprintf(".#nixosConfigurations.%s", host),
+		"--apply", opts.ClosurePathExpr)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error evaluating closure path for %s: %w (stderr: %s)",
+			host, err, stderr.String())
+	}
+
+	if err := json.Unmarshal(stdout.Bytes(), &path); err != nil {
+		return "", fmt.Errorf("failed to unmarshal closure path for %s: %w", host, err)
+	}
+
+	return path, nil
+}
+
+// getHostsConfigs returns configurations for all hosts that match the filter.
+// Uses parallel evaluation for both deployment info and closure paths.
+func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configurations, error) {
+	log.Printf("Getting detailed host configurations...")
+
+	// First get the list of all hosts (lightweight operation)
+	allHosts, err := getHostsList()
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter hosts based on the regex before doing heavy evaluations
+	var filteredHosts []string
+	for _, host := range allHosts {
+		if filter.MatchString(host) {
+			filteredHosts = append(filteredHosts, host)
+		}
+	}
+
+	if len(filteredHosts) == 0 {
+		return nil, fmt.Errorf("no hosts matched the filter: %s", filter.String())
+	}
+
+	log.Printf("Found %d hosts matching filter", len(filteredHosts))
+
+	// Get deployment info for all hosts (can be done in parallel)
+	var wg sync.WaitGroup
+	type deploymentResult struct {
+		host string
+		info DeploymentInfo
+		err  error
+	}
+
+	// Use a buffered channel to collect results
+	deploymentChan := make(chan deploymentResult, len(filteredHosts))
+	deploymentSem := make(chan struct{}, opts.Parallelism) // Use configured parallelism
+
+	// Start goroutines to get deployment info
+	for _, host := range filteredHosts {
+		wg.Add(1)
+		deploymentSem <- struct{}{}
+		go func(h string) {
+			defer wg.Done()
+			defer func() { <-deploymentSem }()
+
+			info, err := getHostDeploymentInfo(h)
+			deploymentChan <- deploymentResult{h, info, err}
+		}(host)
+	}
+
+	// Wait for all deployment info goroutines to complete
+	go func() {
+		wg.Wait()
+		close(deploymentChan)
+	}()
+
+	// Process deployment results and prepare for closure path evaluation
+	configs := make(Configurations)
+	validHosts := make([]string, 0, len(filteredHosts))
+	hostInfo := make(map[string]DeploymentInfo)
+
+	for result := range deploymentChan {
+		if result.err != nil {
+			log.Printf("Warning: Error getting deployment info for %s: %v", result.host, result.err)
+			continue
+		}
+
+		// Skip hosts with no target host
+		if result.info.TargetHost == "" {
+			log.Printf("Warning: Host %s has no target host, skipping", result.host)
+			continue
+		}
+
+		// Store deployment info
+		hostInfo[result.host] = result.info
+		validHosts = append(validHosts, result.host)
+
+		// Initialize host config with deployment info
+		configs[result.host] = HostConfig{
+			Deployment: result.info,
+		}
+	}
+
+	// If we don't need closure paths or no valid hosts, we're done
+	if !needsClosurePath || len(validHosts) == 0 {
+		return configs, nil
+	}
+
+	// Now get closure paths for valid hosts in parallel
+	log.Printf("Getting closure paths for %d hosts in parallel...", len(validHosts))
+
+	type closurePathResult struct {
+		host string
+		path string
+		err  error
+	}
+
+	// Use a buffered channel to collect results
+	pathChan := make(chan closurePathResult, len(validHosts))
+	pathSem := make(chan struct{}, opts.Parallelism) // Use configured parallelism
+
+	// Reset wait group
+	wg = sync.WaitGroup{}
+
+	// Start goroutines to get closure paths
+	for _, host := range validHosts {
+		wg.Add(1)
+		pathSem <- struct{}{}
+		go func(h string) {
+			defer wg.Done()
+			defer func() { <-pathSem }()
+
+			path, err := getHostClosurePath(h)
+			pathChan <- closurePathResult{h, path, err}
+		}(host)
+	}
+
+	// Wait for all closure path goroutines to complete
+	go func() {
+		wg.Wait()
+		close(pathChan)
+	}()
+
+	// Process closure path results
+	for result := range pathChan {
+		if result.err != nil {
+			log.Printf("Warning: Error getting closure path for %s: %v", result.host, result.err)
+			delete(configs, result.host) // Remove host from configs if we can't get its path
+			continue
+		}
+
+		// Update config with closure path
+		cfg := configs[result.host]
+		cfg.Path = result.path
+		configs[result.host] = cfg
+	}
+
 	return configs, nil
+}
+
+// parseConfigurations builds the host configurations based on the filter and whether closure paths are needed.
+func parseConfigurations(needsClosurePath bool) (Configurations, error) {
+	// Compile the filter regex
+	re, err := regexp.Compile(opts.Filter)
+	if err != nil {
+		return nil, fmt.Errorf("error compiling filter regex: %w", err)
+	}
+
+	// Get configurations for matching hosts
+	return getHostsConfigs(re, needsClosurePath)
 }
 
 // sshBaseArgs builds the base SSH arguments.
@@ -160,7 +372,7 @@ func executeConcurrently(configs Configurations, args []string, username string,
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			cmd := action(host, cfg.IP, args, username)
+			cmd := action(host, cfg.Deployment.TargetHost, args, username)
 			if cmd == nil {
 				log.Printf("%s: skipping due to nil command", host)
 				return
@@ -188,23 +400,17 @@ func executeConcurrently(configs Configurations, args []string, username string,
 	return nil
 }
 
-// filterConfigurations returns a subset of configurations matching the filter regex.
-func filterConfigurations(configs Configurations, filter string) (Configurations, error) {
-	re, err := regexp.Compile(filter)
-	if err != nil {
-		return nil, fmt.Errorf("error compiling filter regex: %w", err)
-	}
-
-	filtered := make(Configurations)
+// printSelectedHosts logs the selected hosts and their configurations.
+func printSelectedHosts(configs Configurations) {
 	log.Println("----\nSelected hosts:")
 	for host, cfg := range configs {
-		if re.MatchString(host) {
-			filtered[host] = cfg
-			log.Printf("%s -> %+v", host, cfg)
+		if cfg.Path != "" {
+			log.Printf("%s -> targetHost: %s, path: %s", host, cfg.Deployment.TargetHost, cfg.Path)
+		} else {
+			log.Printf("%s -> targetHost: %s", host, cfg.Deployment.TargetHost)
 		}
 	}
 	log.Println("----")
-	return filtered, nil
 }
 
 // sshAction builds a command to execute an arbitrary command on the host via SSH.
@@ -280,9 +486,9 @@ func compareAction(host, address string, _ []string, username string) *exec.Cmd 
 
 type compareResult struct {
 	host          string
-	expected      string
-	currentSystem string
-	systemProfile string
+	expected      string  // The expected path from the nix evaluation
+	currentSystem string  // Path from /run/current-system
+	systemProfile string  // Path from /nix/var/nix/profiles/system
 	err           error
 }
 
@@ -299,7 +505,7 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			cmd := compareAction(host, cfg.IP, nil, username)
+			cmd := compareAction(host, cfg.Deployment.TargetHost, nil, username)
 			output, err := cmd.CombinedOutput()
 			res := compareResult{
 				host:     host,
@@ -390,22 +596,26 @@ func main() {
 
 	// Set default values.
 	opts = Options{
-		DeployFilePath: DeployFilePath,
-		SkipBuild:      false,
-		TrustNewKeys:   true,
-		UseSubstitutes: true,
-		Verbose:        false,
-		Timeout:        0,
-		Username:       os.Getenv("USER"),
-		Parallelism:    1,
-		Filter:         ".*",
+		ListHostsExpr:   DefaultListHostsExpr,
+		DeploymentExpr:  DefaultDeploymentExpr,
+		ClosurePathExpr: DefaultClosurePathExpr,
+		SkipBuild:       false,
+		TrustNewKeys:    true,
+		UseSubstitutes:  true,
+		Verbose:         false,
+		Timeout:         0,
+		Username:        os.Getenv("USER"),
+		Parallelism:     1,
+		Filter:          ".*",
 	}
 
 	// Define flags.
 	flag.StringVar(&opts.Filter, "on", opts.Filter, "Set the filter to apply")
 	flag.StringVar(&opts.Username, "l", opts.Username, "Specify the username for the target host")
 	flag.IntVar(&opts.Parallelism, "P", opts.Parallelism, "Specify the number of parallel jobs")
-	flag.StringVar(&opts.DeployFilePath, "d", opts.DeployFilePath, "Specify the nix expression file that returns the hosts attrset")
+	flag.StringVar(&opts.ListHostsExpr, "list-hosts-expr", opts.ListHostsExpr, "Nix expression to list hosts (applied to .#nixosConfigurations)")
+	flag.StringVar(&opts.DeploymentExpr, "deployment-expr", opts.DeploymentExpr, "Nix expression to extract deployment info")
+	flag.StringVar(&opts.ClosurePathExpr, "closure-path-expr", opts.ClosurePathExpr, "Nix expression to extract system path")
 	flag.BoolVar(&opts.SkipBuild, "fast", opts.SkipBuild, "Skip the initial build phase")
 	flag.BoolVar(&opts.TrustNewKeys, "trust-new-keys", opts.TrustNewKeys, "Automatically trust new server keys")
 	flag.BoolVar(&opts.UseSubstitutes, "use-substitutes", opts.UseSubstitutes, "Automatically use substitutes when rebuilding")
@@ -444,29 +654,31 @@ Arguments:
 		os.Setenv("NIX_SSHOPTS", "-o StrictHostKeyChecking=accept-new")
 	}
 
-	configs, err := parseConfigurations(opts.DeployFilePath)
+	// Determine if we need closure paths based on the subcommand
+	needsClosurePath := false
+	if len(args) > 0 && (args[0] == "apply" || args[0] == "compare") {
+		needsClosurePath = true
+	}
+
+	configs, err := parseConfigurations(needsClosurePath)
 	if err != nil {
-		flag.Usage()
 		log.Fatalf("Error parsing configurations: %v", err)
 	}
 
-	filteredConfigs, err := filterConfigurations(configs, opts.Filter)
-	if err != nil {
-		log.Fatalf("Error filtering configurations: %v", err)
-	}
+	printSelectedHosts(configs)
 
 	switch subcommand {
 	case "exec":
 		if len(args) < 2 {
 			log.Fatal("Error: No command specified for exec.")
 		}
-		if err := executeConcurrently(filteredConfigs, args[1:], opts.Username, opts.Parallelism, sshAction); err != nil {
+		if err := executeConcurrently(configs, args[1:], opts.Username, opts.Parallelism, sshAction); err != nil {
 			log.Fatal(err)
 		}
 	case "apply":
-		applyWithBuild(filteredConfigs, args[1:], opts.Username, opts.Parallelism)
+		applyWithBuild(configs, args[1:], opts.Username, opts.Parallelism)
 	case "compare":
-		results := getCompareResults(filteredConfigs, opts.Username, opts.Parallelism)
+		results := getCompareResults(configs, opts.Username, opts.Parallelism)
 		var mismatches int
 		if opts.Verbose {
 			mismatches = printCompareVerbose(results)

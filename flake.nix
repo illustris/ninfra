@@ -14,7 +14,6 @@
 					version = "0.1.0";
 					src = ./src;
 					vendorHash = null;
-					ldflags = [ "-X main.DeployFilePath=${copyPathToStore ./src/deploy.nix}" ];
 					env.CGO_ENABLED = 0;
 				}
 			) {};
