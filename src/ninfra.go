@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -569,7 +570,11 @@ func compareAction(host, address string, _ []string, username string) (*CmdWithC
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 
 	// Build the SSH command with options from the environment plus our basic options
-	args := []string{}
+	args := []string{
+		// Add connection timeout to avoid hanging on network issues
+		"-o", "ConnectTimeout=10",
+	}
+
 	if opts.TrustNewKeys {
 		args = append(args, "-o", "StrictHostKeyChecking=accept-new")
 	}
@@ -589,6 +594,28 @@ type compareResult struct {
 	currentSystem string  // Path from /run/current-system
 	systemProfile string  // Path from /nix/var/nix/profiles/system
 	err           error
+}
+
+// createErrorResult is a helper function to create a compareResult with an error
+func createErrorResult(host, expected string, errMsg string, err error) compareResult {
+	return compareResult{
+		host:     host,
+		expected: expected,
+		err:      fmt.Errorf("%s: %w", errMsg, err),
+	}
+}
+
+// readCommandOutput reads all output from a pipe and returns it as a string
+func readCommandOutput(pipe io.Reader) (string, error) {
+	var buffer bytes.Buffer
+	scanner := bufio.NewScanner(pipe)
+	for scanner.Scan() {
+		buffer.WriteString(scanner.Text() + "\n")
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
 }
 
 // getCompareResults collects the compare results from all hosts.
@@ -619,61 +646,32 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			// Get stdout and stderr separately
 			stdoutPipe, err := cmd.StdoutPipe()
 			if err != nil {
-				resultsChan <- compareResult{
-					host:     host,
-					expected: cfg.Path,
-					err:      fmt.Errorf("failed to get stdout pipe: %w", err),
-				}
+				resultsChan <- createErrorResult(host, cfg.Path, "failed to get stdout pipe", err)
 				return
 			}
 
 			stderrPipe, err := cmd.StderrPipe()
 			if err != nil {
-				resultsChan <- compareResult{
-					host:     host,
-					expected: cfg.Path,
-					err:      fmt.Errorf("failed to get stderr pipe: %w", err),
-				}
+				resultsChan <- createErrorResult(host, cfg.Path, "failed to get stderr pipe", err)
 				return
 			}
 
 			// Start the command
 			if err := cmd.Start(); err != nil {
-				resultsChan <- compareResult{
-					host:     host,
-					expected: cfg.Path,
-					err:      fmt.Errorf("failed to start command: %w", err),
-				}
+				resultsChan <- createErrorResult(host, cfg.Path, "failed to start command", err)
 				return
 			}
 
-			// Read stdout
-			var stdout bytes.Buffer
-			stdoutScanner := bufio.NewScanner(stdoutPipe)
-			for stdoutScanner.Scan() {
-				stdout.WriteString(stdoutScanner.Text() + "\n")
-			}
-			if scanErr := stdoutScanner.Err(); scanErr != nil {
-				resultsChan <- compareResult{
-					host:     host,
-					expected: cfg.Path,
-					err:      fmt.Errorf("error reading stdout: %w", scanErr),
-				}
+			// Read stdout and stderr
+			stdoutStr, err := readCommandOutput(stdoutPipe)
+			if err != nil {
+				resultsChan <- createErrorResult(host, cfg.Path, "error reading stdout", err)
 				return
 			}
 
-			// Read stderr
-			var stderr bytes.Buffer
-			stderrScanner := bufio.NewScanner(stderrPipe)
-			for stderrScanner.Scan() {
-				stderr.WriteString(stderrScanner.Text() + "\n")
-			}
-			if scanErr := stderrScanner.Err(); scanErr != nil {
-				resultsChan <- compareResult{
-					host:     host,
-					expected: cfg.Path,
-					err:      fmt.Errorf("error reading stderr: %w", scanErr),
-				}
+			stderrStr, err := readCommandOutput(stderrPipe)
+			if err != nil {
+				resultsChan <- createErrorResult(host, cfg.Path, "error reading stderr", err)
 				return
 			}
 
@@ -685,18 +683,18 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			}
 
 			if err != nil {
-				res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderr.String())
+				res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderrStr)
 				resultsChan <- res
 				return
 			}
 
 			// Only process stdout for paths
-			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+			lines := strings.Split(strings.TrimSpace(stdoutStr), "\n")
 			if len(lines) >= 2 {
 				res.currentSystem = strings.TrimSpace(lines[0])
 				res.systemProfile = strings.TrimSpace(lines[1])
 			} else {
-				res.err = fmt.Errorf("unexpected output from realpath command: %s", stdout.String())
+				res.err = fmt.Errorf("realpath command didn't return the expected two path lines, got: %s", stdoutStr)
 			}
 			resultsChan <- res
 		}(host, cfg)
