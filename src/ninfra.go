@@ -479,9 +479,20 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 
 // compareAction builds the command used to compare system paths.
 func compareAction(host, address string, _ []string, username string) *exec.Cmd {
-	baseArgs := sshBaseArgs(username, address, false, opts.TrustNewKeys)
-	childArgs := append(baseArgs, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
-	return newCmd("ssh", childArgs...)
+	// For the compare command, we handle SSH errors more explicitly to show the user why connections failed
+	sshTarget := fmt.Sprintf("%s@%s", username, address)
+
+	// Build the SSH command with options from the environment plus our basic options
+	args := []string{}
+	if opts.TrustNewKeys {
+		args = append(args, "-o", "StrictHostKeyChecking=accept-new")
+	}
+	args = append(args, sshTarget, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
+
+	// Debug log the command
+	log.Printf("Compare command for %s: ssh %v", host, args)
+
+	return newCmd("ssh", args...)
 }
 
 type compareResult struct {
@@ -506,23 +517,88 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			defer func() { <-sem }()
 
 			cmd := compareAction(host, cfg.Deployment.TargetHost, nil, username)
-			output, err := cmd.CombinedOutput()
+
+			// Get stdout and stderr separately
+			stdoutPipe, err := cmd.StdoutPipe()
+			if err != nil {
+				resultsChan <- compareResult{
+					host:     host,
+					expected: cfg.Path,
+					err:      fmt.Errorf("failed to get stdout pipe: %w", err),
+				}
+				return
+			}
+
+			stderrPipe, err := cmd.StderrPipe()
+			if err != nil {
+				resultsChan <- compareResult{
+					host:     host,
+					expected: cfg.Path,
+					err:      fmt.Errorf("failed to get stderr pipe: %w", err),
+				}
+				return
+			}
+
+			// Start the command
+			if err := cmd.Start(); err != nil {
+				resultsChan <- compareResult{
+					host:     host,
+					expected: cfg.Path,
+					err:      fmt.Errorf("failed to start command: %w", err),
+				}
+				return
+			}
+
+			// Read stdout
+			var stdout bytes.Buffer
+			stdoutScanner := bufio.NewScanner(stdoutPipe)
+			for stdoutScanner.Scan() {
+				stdout.WriteString(stdoutScanner.Text() + "\n")
+			}
+			if scanErr := stdoutScanner.Err(); scanErr != nil {
+				resultsChan <- compareResult{
+					host:     host,
+					expected: cfg.Path,
+					err:      fmt.Errorf("error reading stdout: %w", scanErr),
+				}
+				return
+			}
+
+			// Read stderr
+			var stderr bytes.Buffer
+			stderrScanner := bufio.NewScanner(stderrPipe)
+			for stderrScanner.Scan() {
+				stderr.WriteString(stderrScanner.Text() + "\n")
+			}
+			if scanErr := stderrScanner.Err(); scanErr != nil {
+				resultsChan <- compareResult{
+					host:     host,
+					expected: cfg.Path,
+					err:      fmt.Errorf("error reading stderr: %w", scanErr),
+				}
+				return
+			}
+
+			// Wait for command to finish
+			err = cmd.Wait()
 			res := compareResult{
 				host:     host,
 				expected: cfg.Path,
 			}
+
 			if err != nil {
-				res.err = fmt.Errorf("error executing SSH command: %w, output: %s", err, string(output))
+				res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderr.String())
 				resultsChan <- res
 				return
 			}
 
-			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+			// Only process stdout for paths
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 			if len(lines) >= 2 {
 				res.currentSystem = strings.TrimSpace(lines[0])
 				res.systemProfile = strings.TrimSpace(lines[1])
 			} else {
-				res.err = fmt.Errorf("unexpected output: %s", string(output))
+				res.err = fmt.Errorf("unexpected output from realpath command: %s", stdout.String())
 			}
 			resultsChan <- res
 		}(host, cfg)
@@ -539,14 +615,13 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 }
 
 // printCompareVerbose outputs a detailed comparison report.
-func printCompareVerbose(results []compareResult) int {
-	mismatches := 0
+// It no longer returns a count as we use the table's count as the source of truth.
+func printCompareVerbose(results []compareResult) {
 	fmt.Println("==== Compare Report ====")
 	for _, res := range results {
 		fmt.Printf("Host: %s\n", res.host)
 		if res.err != nil {
 			fmt.Printf("  Error: %v\n", res.err)
-			mismatches++
 		} else {
 			fmt.Printf("  Expected path: %s\n", res.expected)
 			csStatus, spStatus := "MATCH", "MATCH"
@@ -558,13 +633,9 @@ func printCompareVerbose(results []compareResult) int {
 			}
 			fmt.Printf("  /run/current-system: %s (%s)\n", res.currentSystem, csStatus)
 			fmt.Printf("  /nix/var/nix/profiles/system: %s (%s)\n", res.systemProfile, spStatus)
-			if csStatus == "MISMATCH" || spStatus == "MISMATCH" {
-				mismatches++
-			}
 		}
 		fmt.Println("----")
 	}
-	return mismatches
 }
 
 // printCompareTable outputs a summary table of the comparison.
@@ -679,14 +750,42 @@ Arguments:
 		applyWithBuild(configs, args[1:], opts.Username, opts.Parallelism)
 	case "compare":
 		results := getCompareResults(configs, opts.Username, opts.Parallelism)
-		var mismatches int
-		if opts.Verbose {
-			mismatches = printCompareVerbose(results)
-		} else {
-			mismatches = printCompareTable(results)
+
+		// Check if any hosts have SSH errors and display them prominently
+		var sshErrors int
+		for _, res := range results {
+			if res.err != nil {
+				sshErrors++
+			}
 		}
-		if mismatches > 0 {
-			fmt.Printf("\nFound %d host(s) with mismatches/errors.\n", mismatches)
+
+		if sshErrors > 0 {
+			fmt.Println("\n==== SSH Connection Errors ====")
+			for _, res := range results {
+				if res.err != nil {
+					fmt.Printf("Host: %s\n", res.host)
+					fmt.Printf("Error: %v\n", res.err)
+					fmt.Println("----")
+				}
+			}
+			fmt.Printf("\nFound %d host(s) with SSH connection errors.\n", sshErrors)
+			os.Exit(1)
+		}
+
+		// Only if no SSH errors, display the comparison results
+
+		// Always show the comparison table
+		tableMismatches := printCompareTable(results)
+
+		// If verbose mode is on, also show the detailed report
+		if opts.Verbose {
+			fmt.Println() // Add spacing between table and verbose output
+			printCompareVerbose(results)
+		}
+
+		// Use the table mismatches as the source of truth for exit code
+		if tableMismatches > 0 {
+			fmt.Printf("\nFound %d host(s) with mismatches.\n", tableMismatches)
 			os.Exit(1)
 		}
 	default:
