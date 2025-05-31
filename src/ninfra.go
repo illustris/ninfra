@@ -489,8 +489,10 @@ func compareAction(host, address string, _ []string, username string) *exec.Cmd 
 	}
 	args = append(args, sshTarget, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
 
-	// Debug log the command
-	log.Printf("Compare command for %s: ssh %v", host, args)
+	// Debug log the command only in verbose mode
+	if opts.Verbose {
+		log.Printf("Compare command for %s: ssh %v", host, args)
+	}
 
 	return newCmd("ssh", args...)
 }
@@ -639,12 +641,14 @@ func printCompareVerbose(results []compareResult) {
 }
 
 // printCompareTable outputs a summary table of the comparison.
-func printCompareTable(results []compareResult) int {
+// Returns (mismatches, sshErrors)
+func printCompareTable(results []compareResult) (int, int) {
 	mismatches := 0
+	sshErrors := 0
 	fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", "HOST", "ACTIVE", "BOOT", "PERSISTED", "STATUS")
 	for _, res := range results {
 		if res.err != nil {
-			mismatches++
+			sshErrors++
 			fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, "ERR", "ERR", "ERR", "Connection failed")
 			continue
 		}
@@ -668,7 +672,7 @@ func printCompareTable(results []compareResult) int {
 
 		fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, active, boot, persisted, status)
 	}
-	return mismatches
+	return mismatches, sshErrors
 }
 
 func main() {
@@ -761,31 +765,8 @@ Arguments:
 	case "compare":
 		results := getCompareResults(configs, opts.Username, opts.Parallelism)
 
-		// Check if any hosts have SSH errors and display them prominently
-		var sshErrors int
-		for _, res := range results {
-			if res.err != nil {
-				sshErrors++
-			}
-		}
-
-		if sshErrors > 0 {
-			fmt.Println("\n==== SSH Connection Errors ====")
-			for _, res := range results {
-				if res.err != nil {
-					fmt.Printf("Host: %s\n", res.host)
-					fmt.Printf("Error: %v\n", res.err)
-					fmt.Println("----")
-				}
-			}
-			fmt.Printf("\nFound %d host(s) with SSH connection errors.\n", sshErrors)
-			os.Exit(1)
-		}
-
-		// Only if no SSH errors, display the comparison results
-
-		// Always show the comparison table
-		tableMismatches := printCompareTable(results)
+		// Always show the comparison table (includes SSH errors as connection failures)
+		tableMismatches, sshErrors := printCompareTable(results)
 
 		// If verbose mode is on, also show the detailed report
 		if opts.Verbose {
@@ -793,8 +774,14 @@ Arguments:
 			printCompareVerbose(results)
 		}
 
-		// Use the table mismatches as the source of truth for exit code
-		if tableMismatches > 0 {
+		// Print appropriate message based on what failed
+		if sshErrors > 0 && tableMismatches > 0 {
+			fmt.Printf("\nFound %d host(s) with mismatches and %d host(s) with connection errors.\n", tableMismatches, sshErrors)
+			os.Exit(1)
+		} else if sshErrors > 0 {
+			fmt.Printf("\nFound %d host(s) with connection errors.\n", sshErrors)
+			os.Exit(1)
+		} else if tableMismatches > 0 {
 			fmt.Printf("\nFound %d host(s) with mismatches.\n", tableMismatches)
 			os.Exit(1)
 		}
