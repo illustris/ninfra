@@ -641,8 +641,14 @@ func printCompareVerbose(results []compareResult) {
 // printCompareTable outputs a summary table of the comparison.
 func printCompareTable(results []compareResult) int {
 	mismatches := 0
-	fmt.Printf("%-20s %-7s %-7s %-10s\n", "HOST", "ACTIVE", "BOOT", "PERSISTED")
+	fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", "HOST", "ACTIVE", "BOOT", "PERSISTED", "STATUS")
 	for _, res := range results {
+		if res.err != nil {
+			mismatches++
+			fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, "ERR", "ERR", "ERR", "Connection failed")
+			continue
+		}
+
 		active, boot, persisted := "N", "N", "N"
 		if res.currentSystem == res.expected {
 			active = "Y"
@@ -653,10 +659,14 @@ func printCompareTable(results []compareResult) int {
 		if res.currentSystem == res.systemProfile {
 			persisted = "Y"
 		}
+
+		status := "OK"
 		if active != "Y" || boot != "Y" {
+			status = "Mismatch detected"
 			mismatches++
 		}
-		fmt.Printf("%-20s %-7s %-7s %-10s\n", res.host, active, boot, persisted)
+
+		fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, active, boot, persisted, status)
 	}
 	return mismatches
 }
