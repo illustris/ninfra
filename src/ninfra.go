@@ -295,23 +295,35 @@ func sshBaseArgs(username, address string, addSeparator bool, trustNewKeys bool)
 	return args
 }
 
-// ActionFunc defines a function that creates an exec.Cmd for a given host action.
-type ActionFunc func(host, address string, args []string, username string) *exec.Cmd
+// ActionFunc defines a function that creates a CmdWithCancel for a given host action.
+type ActionFunc func(host, address string, args []string, username string) *CmdWithCancel
+
+// CmdWithCancel wraps an exec.Cmd and its context cancel function.
+type CmdWithCancel struct {
+	*exec.Cmd
+	Cancel context.CancelFunc
+}
 
 // newCmd creates an exec.Cmd, attaching a timeout if one is set.
-func newCmd(name string, args ...string) *exec.Cmd {
+// Returns a CmdWithCancel that includes the cancel function for proper cleanup.
+func newCmd(name string, args ...string) *CmdWithCancel {
 	if opts.Timeout > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
-		// Note: We do not call cancel() here since the command will run until completion.
-		// In a more advanced version, you could manage the cancel function after cmd.Wait().
-		_ = cancel
-		return exec.CommandContext(ctx, name, args...)
+		return &CmdWithCancel{
+			Cmd:    exec.CommandContext(ctx, name, args...),
+			Cancel: cancel,
+		}
 	}
-	return exec.Command(name, args...)
+	return &CmdWithCancel{
+		Cmd:    exec.Command(name, args...),
+		Cancel: func() {}, // No-op cancel for non-timeout commands
+	}
 }
 
 // executeAndStreamOutput streams stdout and stderr for the given command.
-func executeAndStreamOutput(host string, cmd *exec.Cmd) error {
+func executeAndStreamOutput(host string, cmdWithCancel *CmdWithCancel) error {
+	defer cmdWithCancel.Cancel() // Ensure context is properly cleaned up
+	cmd := cmdWithCancel.Cmd
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("%s: failed to get stdout pipe: %w", host, err)
@@ -414,14 +426,14 @@ func printSelectedHosts(configs Configurations) {
 }
 
 // sshAction builds a command to execute an arbitrary command on the host via SSH.
-func sshAction(host, address string, args []string, username string) *exec.Cmd {
+func sshAction(host, address string, args []string, username string) *CmdWithCancel {
 	baseArgs := sshBaseArgs(username, address, true, opts.TrustNewKeys)
 	childArgs := append(baseArgs, args...)
 	return newCmd("ssh", childArgs...)
 }
 
 // nixosRebuildAction builds the command for a nixos-rebuild action (apply phase).
-func nixosRebuildAction(host, address string, args []string, username string) *exec.Cmd {
+func nixosRebuildAction(host, address string, args []string, username string) *CmdWithCancel {
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	if len(args) == 0 {
@@ -438,7 +450,7 @@ func nixosRebuildAction(host, address string, args []string, username string) *e
 }
 
 // nixosBuildAction builds the command for the build phase.
-func nixosBuildAction(host, address string, _ []string, username string) *exec.Cmd {
+func nixosBuildAction(host, address string, _ []string, username string) *CmdWithCancel {
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	cmdArgs := []string{"build"}
@@ -478,7 +490,7 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 }
 
 // compareAction builds the command used to compare system paths.
-func compareAction(host, address string, _ []string, username string) *exec.Cmd {
+func compareAction(host, address string, _ []string, username string) *CmdWithCancel {
 	// For the compare command, we handle SSH errors more explicitly to show the user why connections failed
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 
@@ -518,7 +530,9 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			cmd := compareAction(host, cfg.Deployment.TargetHost, nil, username)
+			cmdWithCancel := compareAction(host, cfg.Deployment.TargetHost, nil, username)
+			defer cmdWithCancel.Cancel() // Ensure context cleanup
+			cmd := cmdWithCancel.Cmd
 
 			// Get stdout and stderr separately
 			stdoutPipe, err := cmd.StdoutPipe()
