@@ -421,7 +421,8 @@ func executeAndStreamOutput(host string, cmdWithCancel *CmdWithCancel) error {
 // executeConcurrently runs the given action concurrently on all hosts.
 func executeConcurrently(configs Configurations, args []string, username string, parallelism int, action ActionFunc) error {
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(configs))
+	var errorCount int32
+	var errorMutex sync.Mutex
 	sem := make(chan struct{}, parallelism)
 
 	for host, cfg := range configs {
@@ -433,7 +434,10 @@ func executeConcurrently(configs Configurations, args []string, username string,
 
 			cmd, err := action(host, cfg.Deployment.TargetHost, args, username)
 			if err != nil {
-				errChan <- fmt.Errorf("%s: %w", host, err)
+				log.Printf("Error creating command for %s: %v", host, err)
+				errorMutex.Lock()
+				errorCount++
+				errorMutex.Unlock()
 				return
 			}
 			if cmd == nil {
@@ -442,23 +446,18 @@ func executeConcurrently(configs Configurations, args []string, username string,
 			}
 
 			if err := executeAndStreamOutput(host, cmd); err != nil {
-				errChan <- fmt.Errorf("%s: %w", host, err)
+				log.Printf("Error executing command for %s: %v", host, err)
+				errorMutex.Lock()
+				errorCount++
+				errorMutex.Unlock()
 			}
 		}(host, cfg)
 	}
 
 	wg.Wait()
-	close(errChan)
 
-	var errs []string
-	for err := range errChan {
-		errs = append(errs, err.Error())
-	}
-	if len(errs) > 0 {
-		for _, msg := range errs {
-			log.Println(msg)
-		}
-		return fmt.Errorf("one or more commands failed")
+	if errorCount > 0 {
+		return fmt.Errorf("%d command(s) failed", errorCount)
 	}
 	return nil
 }
