@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type DeploymentInfo struct {
@@ -55,6 +56,35 @@ type Options struct {
 }
 
 var opts Options
+
+// isValidUsername checks if a username is safe for SSH usage
+func isValidUsername(username string) bool {
+	if username == "" || len(username) > 32 {
+		return false
+	}
+	for _, r := range username {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidHostname checks if a hostname/address is safe for SSH usage
+func isValidHostname(hostname string) bool {
+	if hostname == "" || len(hostname) > 253 {
+		return false
+	}
+	// Allow IPv4, IPv6, and domain names
+	// Basic validation - no shell metacharacters
+	for _, r := range hostname {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) &&
+		   r != '-' && r != '.' && r != ':' && r != '[' && r != ']' {
+			return false
+		}
+	}
+	return true
+}
 
 // getHostsList returns a list of all host names in the flake.
 func getHostsList() ([]string, error) {
@@ -282,7 +312,14 @@ func parseConfigurations(needsClosurePath bool) (Configurations, error) {
 }
 
 // sshBaseArgs builds the base SSH arguments.
-func sshBaseArgs(username, address string, addSeparator bool, trustNewKeys bool) []string {
+func sshBaseArgs(username, address string, addSeparator bool, trustNewKeys bool) ([]string, error) {
+	if !isValidUsername(username) {
+		return nil, fmt.Errorf("invalid username: %s", username)
+	}
+	if !isValidHostname(address) {
+		return nil, fmt.Errorf("invalid hostname/address: %s", address)
+	}
+
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	args := []string{}
 	if trustNewKeys {
@@ -292,11 +329,11 @@ func sshBaseArgs(username, address string, addSeparator bool, trustNewKeys bool)
 	if addSeparator {
 		args = append(args, "--")
 	}
-	return args
+	return args, nil
 }
 
 // ActionFunc defines a function that creates a CmdWithCancel for a given host action.
-type ActionFunc func(host, address string, args []string, username string) *CmdWithCancel
+type ActionFunc func(host, address string, args []string, username string) (*CmdWithCancel, error)
 
 // CmdWithCancel wraps an exec.Cmd and its context cancel function.
 type CmdWithCancel struct {
@@ -384,7 +421,11 @@ func executeConcurrently(configs Configurations, args []string, username string,
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			cmd := action(host, cfg.Deployment.TargetHost, args, username)
+			cmd, err := action(host, cfg.Deployment.TargetHost, args, username)
+			if err != nil {
+				errChan <- fmt.Errorf("%s: %w", host, err)
+				return
+			}
 			if cmd == nil {
 				log.Printf("%s: skipping due to nil command", host)
 				return
@@ -426,14 +467,24 @@ func printSelectedHosts(configs Configurations) {
 }
 
 // sshAction builds a command to execute an arbitrary command on the host via SSH.
-func sshAction(host, address string, args []string, username string) *CmdWithCancel {
-	baseArgs := sshBaseArgs(username, address, true, opts.TrustNewKeys)
+func sshAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
+	baseArgs, err := sshBaseArgs(username, address, true, opts.TrustNewKeys)
+	if err != nil {
+		return nil, err
+	}
 	childArgs := append(baseArgs, args...)
-	return newCmd("ssh", childArgs...)
+	return newCmd("ssh", childArgs...), nil
 }
 
 // nixosRebuildAction builds the command for a nixos-rebuild action (apply phase).
-func nixosRebuildAction(host, address string, args []string, username string) *CmdWithCancel {
+func nixosRebuildAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
+	if !isValidUsername(username) {
+		return nil, fmt.Errorf("invalid username: %s", username)
+	}
+	if !isValidHostname(address) {
+		return nil, fmt.Errorf("invalid hostname/address: %s", address)
+	}
+
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	if len(args) == 0 {
@@ -446,11 +497,18 @@ func nixosRebuildAction(host, address string, args []string, username string) *C
 		cmdArgs = append(cmdArgs, "--use-substitutes")
 	}
 	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTarget)
-	return newCmd("nixos-rebuild", cmdArgs...)
+	return newCmd("nixos-rebuild", cmdArgs...), nil
 }
 
 // nixosBuildAction builds the command for the build phase.
-func nixosBuildAction(host, address string, _ []string, username string) *CmdWithCancel {
+func nixosBuildAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
+	if !isValidUsername(username) {
+		return nil, fmt.Errorf("invalid username: %s", username)
+	}
+	if !isValidHostname(address) {
+		return nil, fmt.Errorf("invalid hostname/address: %s", address)
+	}
+
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	cmdArgs := []string{"build"}
@@ -458,7 +516,7 @@ func nixosBuildAction(host, address string, _ []string, username string) *CmdWit
 		cmdArgs = append(cmdArgs, "--use-substitutes")
 	}
 	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTarget)
-	return newCmd("nixos-rebuild", cmdArgs...)
+	return newCmd("nixos-rebuild", cmdArgs...), nil
 }
 
 // applyWithBuild performs the build phase (unless skipped) and then the apply phase.
@@ -490,7 +548,14 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 }
 
 // compareAction builds the command used to compare system paths.
-func compareAction(host, address string, _ []string, username string) *CmdWithCancel {
+func compareAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
+	if !isValidUsername(username) {
+		return nil, fmt.Errorf("invalid username: %s", username)
+	}
+	if !isValidHostname(address) {
+		return nil, fmt.Errorf("invalid hostname/address: %s", address)
+	}
+
 	// For the compare command, we handle SSH errors more explicitly to show the user why connections failed
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 
@@ -506,7 +571,7 @@ func compareAction(host, address string, _ []string, username string) *CmdWithCa
 		log.Printf("Compare command for %s: ssh %v", host, args)
 	}
 
-	return newCmd("ssh", args...)
+	return newCmd("ssh", args...), nil
 }
 
 type compareResult struct {
@@ -530,7 +595,15 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			cmdWithCancel := compareAction(host, cfg.Deployment.TargetHost, nil, username)
+			cmdWithCancel, err := compareAction(host, cfg.Deployment.TargetHost, nil, username)
+			if err != nil {
+				resultsChan <- compareResult{
+					host:     host,
+					expected: cfg.Path,
+					err:      fmt.Errorf("failed to create command: %w", err),
+				}
+				return
+			}
 			defer cmdWithCancel.Cancel() // Ensure context cleanup
 			cmd := cmdWithCancel.Cmd
 
@@ -747,6 +820,11 @@ Arguments:
 		os.Exit(1)
 	}
 	subcommand := args[0]
+
+	// Validate parallelism parameter
+	if opts.Parallelism <= 0 {
+		log.Fatalf("Parallelism must be greater than 0, got: %d", opts.Parallelism)
+	}
 
 	// Set the environment variable used by nixos-rebuild.
 	if opts.TrustNewKeys {
