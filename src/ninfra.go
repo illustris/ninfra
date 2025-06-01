@@ -211,6 +211,11 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 
 	// Wait for all deployment info goroutines to complete
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in deployment channel closer: %v", r)
+			}
+		}()
 		wg.Wait()
 		close(deploymentChan)
 	}()
@@ -278,6 +283,11 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 
 	// Wait for all closure path goroutines to complete
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in closure path channel closer: %v", r)
+			}
+		}()
 		wg.Wait()
 		close(pathChan)
 	}()
