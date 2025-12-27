@@ -65,7 +65,7 @@
 		checks.x86_64-linux = {
 			ninfra-basic = let
 				targetModules = rec {
-					base = { config, pkgs, ... }: {
+					base = { pkgs, ... }: {
 						passthru.deployment.targetHost = "target";
 						services.openssh.enable = true;
 						virtualisation.diskSize = 4096;
@@ -75,7 +75,7 @@
 						# Use grub forceInstall to avoid ext2 embedding issues in VM
 						boot.loader.grub.forceInstall = true;
 					};
-					modified = { config, pkgs, ... }: {
+					modified = { pkgs, ... }: {
 						imports = [ base ];
 						services.prometheus.exporters.node = {
 							enable = true;
@@ -84,7 +84,7 @@
 					};
 				};
 				ssh-keys = import "${nixpkgs}/nixos/tests/ssh-keys.nix" nixpkgs.legacyPackages.x86_64-linux;
-			in nixpkgs.legacyPackages.x86_64-linux.nixosTest {
+			in nixpkgs.legacyPackages.x86_64-linux.testers.nixosTest {
 				name = "ninfra-basic";
 				# Increase timeout since nix copy over SSH can be slow
 				globalTimeout = 1800;
@@ -131,15 +131,19 @@
 					# Verify flake is accessible (no --override-input needed with registry)
 					controller.succeed("nix flake show $(realpath /etc/flake/)")
 
+					# Copy flake to writable location (nixos-rebuild creates result symlink in cwd)
+					controller.succeed("cp -r $(realpath /etc/flake) /tmp/flake")
+					controller.succeed("chmod +w /tmp/flake")
+
 					# Compare should show mismatch initially (N N N) and exit with code 1
-					(status, output) = controller.execute("cd /etc/flake/ && ninfra compare 2>&1")
+					(status, output) = controller.execute("cd /tmp/flake && ninfra compare 2>&1")
 					print(output)
 					assert status == 1, f"Expected exit code 1 for mismatch, got: {status}"
 					assert re.search(r'target\s+N\s+N\s+N', output), f"Expected initial mismatch, got: {output}"
 
 					# Apply - nixos-rebuild --target-host has a known issue where it doesn't exit
 					# after switch completes, so we use timeout and check output for success
-					(status, output) = controller.execute("cd /etc/flake/ && timeout 300 ninfra -l root apply 2>&1")
+					(status, output) = controller.execute("cd /tmp/flake && timeout 300 ninfra -l root apply 2>&1")
 					print(f"Apply exit status: {status}")
 					print(output)
 					# Accept exit 124 (timeout) if the switch actually succeeded
@@ -153,7 +157,7 @@
 					target.wait_for_unit("network-addresses-eth1.service")
 
 					# Verify deployment succeeded - compare should now show match (Y Y Y)
-					output = controller.succeed("cd /etc/flake/ && ninfra compare 2>&1")
+					output = controller.succeed("cd /tmp/flake && ninfra compare 2>&1")
 					print(output)
 					assert re.search(r'target\s+Y\s+Y\s+Y', output), f"Expected match after apply, got: {output}"
 				'';
