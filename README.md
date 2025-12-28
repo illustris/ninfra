@@ -34,6 +34,7 @@ ninfra <subcommand> [options] [arguments]
 #### SSH Options
 
 - `--trust-new-keys`: Automatically trust new server keys (default: `true`).
+- `-c <seconds>`: SSH connection timeout in seconds (default: `10`).
 
 #### Apply Options
 

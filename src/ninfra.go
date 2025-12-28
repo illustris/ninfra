@@ -51,6 +51,7 @@ type Options struct {
 	UseSubstitutes    bool
 	Verbose           bool
 	Timeout           time.Duration
+	ConnectTimeout    int
 	Username          string
 	Parallelism       int
 	Filter            string
@@ -228,13 +229,13 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 
 	for result := range deploymentChan {
 		if result.err != nil {
-			log.Printf("Warning: Error getting deployment info for %s: %v", result.host, result.err)
+			log.Printf("Excluding host %s: failed to get deployment info: %v", result.host, result.err)
 			continue
 		}
 
 		// Skip hosts with no target host
 		if result.info.TargetHost == "" {
-			log.Printf("Warning: Host %s has no target host, skipping", result.host)
+			log.Printf("Excluding host %s: no target host configured", result.host)
 			continue
 		}
 
@@ -296,8 +297,8 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 	// Process closure path results
 	for result := range pathChan {
 		if result.err != nil {
-			log.Printf("Warning: Error getting closure path for %s: %v", result.host, result.err)
-			delete(configs, result.host) // Remove host from configs if we can't get its path
+			log.Printf("Excluding host %s: failed to get closure path: %v", result.host, result.err)
+			delete(configs, result.host)
 			continue
 		}
 
@@ -488,13 +489,6 @@ func sshAction(host, address string, args []string, username string) (*CmdWithCa
 
 // nixosRebuildAction builds the command for a nixos-rebuild action (apply phase).
 func nixosRebuildAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
-	if !isValidUsername(username) {
-		return nil, fmt.Errorf("invalid username: %s", username)
-	}
-	if !isValidHostname(address) {
-		return nil, fmt.Errorf("invalid hostname/address: %s", address)
-	}
-
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	if len(args) == 0 {
@@ -512,13 +506,6 @@ func nixosRebuildAction(host, address string, args []string, username string) (*
 
 // nixosBuildAction builds the command for the build phase.
 func nixosBuildAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
-	if !isValidUsername(username) {
-		return nil, fmt.Errorf("invalid username: %s", username)
-	}
-	if !isValidHostname(address) {
-		return nil, fmt.Errorf("invalid hostname/address: %s", address)
-	}
-
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 	cmdArgs := []string{"build"}
@@ -559,20 +546,13 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 
 // compareAction builds the command used to compare system paths.
 func compareAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
-	if !isValidUsername(username) {
-		return nil, fmt.Errorf("invalid username: %s", username)
-	}
-	if !isValidHostname(address) {
-		return nil, fmt.Errorf("invalid hostname/address: %s", address)
-	}
-
 	// For the compare command, we handle SSH errors more explicitly to show the user why connections failed
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 
 	// Build the SSH command with options from the environment plus our basic options
 	args := []string{
 		// Add connection timeout to avoid hanging on network issues
-		"-o", "ConnectTimeout=10",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", opts.ConnectTimeout),
 	}
 
 	if opts.TrustNewKeys {
@@ -783,6 +763,7 @@ func main() {
 		UseSubstitutes:  true,
 		Verbose:         false,
 		Timeout:         0,
+		ConnectTimeout:  10,
 		Username:        os.Getenv("USER"),
 		Parallelism:     1,
 		Filter:          ".*",
@@ -792,6 +773,7 @@ func main() {
 	flag.StringVar(&opts.Filter, "on", opts.Filter, "Set the filter to apply")
 	flag.StringVar(&opts.Username, "l", opts.Username, "Specify the username for the target host")
 	flag.IntVar(&opts.Parallelism, "P", opts.Parallelism, "Specify the number of parallel jobs")
+	flag.IntVar(&opts.ConnectTimeout, "c", opts.ConnectTimeout, "SSH connection timeout in seconds")
 	flag.StringVar(&opts.ListHostsExpr, "list-hosts-expr", opts.ListHostsExpr, "Nix expression to list hosts (applied to .#nixosConfigurations)")
 	flag.StringVar(&opts.DeploymentExpr, "deployment-expr", opts.DeploymentExpr, "Nix expression to extract deployment info")
 	flag.StringVar(&opts.ClosurePathExpr, "closure-path-expr", opts.ClosurePathExpr, "Nix expression to extract system path")
