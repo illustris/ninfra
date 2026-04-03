@@ -842,6 +842,10 @@ Arguments:
 			log.Fatal(err)
 		}
 	case "apply":
+		if len(configs) == 1 && !opts.SkipBuild {
+			log.Println("Single target node, implicitly skipping separate build phase.")
+			opts.SkipBuild = true
+		}
 		applyWithBuild(configs, args[1:], opts.Username, opts.Parallelism)
 	case "compare":
 		results := getCompareResults(configs, opts.Username, opts.Parallelism)
