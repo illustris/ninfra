@@ -10,7 +10,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +31,7 @@ type HostConfig struct {
 type Configurations map[string]HostConfig
 
 // Default Nix expressions
-var (
+const (
 	// Expression to list all hosts from nixosConfigurations
 	DefaultListHostsExpr = "builtins.attrNames"
 
@@ -45,6 +47,7 @@ var (
 
 // Options contains configuration flags and settings.
 type Options struct {
+	FlakeRef        string
 	ListHostsExpr   string
 	DeploymentExpr  string
 	ClosurePathExpr string
@@ -52,6 +55,7 @@ type Options struct {
 	TrustNewKeys    bool
 	UseSubstitutes  bool
 	Verbose         bool
+	JSONOutput      bool
 	Timeout         time.Duration
 	ConnectTimeout  int
 	Username        string
@@ -66,6 +70,10 @@ func isValidUsername(username string) bool {
 	if username == "" || len(username) > 32 {
 		return false
 	}
+	// A leading '-' would be parsed as an ssh option
+	if username[0] == '-' {
+		return false
+	}
 	for _, r := range username {
 		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' && r != '.' {
 			return false
@@ -77,6 +85,10 @@ func isValidUsername(username string) bool {
 // isValidHostname checks if a hostname/address is safe for SSH usage
 func isValidHostname(hostname string) bool {
 	if hostname == "" || len(hostname) > 253 {
+		return false
+	}
+	// A leading '-' would be parsed as an ssh option
+	if hostname[0] == '-' {
 		return false
 	}
 	// Allow IPv4, IPv6, and domain names
@@ -95,7 +107,7 @@ func getHostsList() ([]string, error) {
 	log.Printf("Getting list of hosts...")
 
 	// Build command to get all hosts by name only (lightweight)
-	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations", "--apply", opts.ListHostsExpr)
+	cmd := exec.Command("nix", "eval", "--json", opts.FlakeRef+"#nixosConfigurations", "--apply", opts.ListHostsExpr)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -136,7 +148,7 @@ func hostApplyExpr(expr, host string) string {
 func getHostDeploymentInfo(host string) (DeploymentInfo, error) {
 	var deploymentInfo DeploymentInfo
 
-	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations",
+	cmd := exec.Command("nix", "eval", "--json", opts.FlakeRef+"#nixosConfigurations",
 		"--apply", hostApplyExpr(opts.DeploymentExpr, host))
 
 	var stdout, stderr bytes.Buffer
@@ -159,7 +171,7 @@ func getHostDeploymentInfo(host string) (DeploymentInfo, error) {
 func getHostClosurePath(host string) (string, error) {
 	var path string
 
-	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations",
+	cmd := exec.Command("nix", "eval", "--json", opts.FlakeRef+"#nixosConfigurations",
 		"--apply", hostApplyExpr(opts.ClosurePathExpr, host))
 
 	var stdout, stderr bytes.Buffer
@@ -200,6 +212,7 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 	if len(filteredHosts) == 0 {
 		return nil, fmt.Errorf("no hosts matched the filter: %s", filter.String())
 	}
+	sort.Strings(filteredHosts)
 
 	log.Printf("Found %d hosts matching filter", len(filteredHosts))
 
@@ -230,11 +243,6 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 
 	// Wait for all deployment info goroutines to complete
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("Panic in deployment channel closer: %v", r)
-			}
-		}()
 		wg.Wait()
 		close(deploymentChan)
 	}()
@@ -242,7 +250,6 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 	// Process deployment results and prepare for closure path evaluation
 	configs := make(Configurations)
 	validHosts := make([]string, 0, len(filteredHosts))
-	hostInfo := make(map[string]DeploymentInfo)
 
 	for result := range deploymentChan {
 		if result.err != nil {
@@ -256,8 +263,6 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 			continue
 		}
 
-		// Store deployment info
-		hostInfo[result.host] = result.info
 		validHosts = append(validHosts, result.host)
 
 		// Initialize host config with deployment info
@@ -302,11 +307,6 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 
 	// Wait for all closure path goroutines to complete
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("Panic in closure path channel closer: %v", r)
-			}
-		}()
 		wg.Wait()
 		close(pathChan)
 	}()
@@ -330,8 +330,9 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 
 // parseConfigurations builds the host configurations based on the filter and whether closure paths are needed.
 func parseConfigurations(needsClosurePath bool) (Configurations, error) {
-	// Compile the filter regex
-	re, err := regexp.Compile(opts.Filter)
+	// Compile the filter regex, anchored so '--on prod' cannot silently
+	// select 'preprod-db'; substring matching needs an explicit '.*'.
+	re, err := regexp.Compile("^(?:" + opts.Filter + ")$")
 	if err != nil {
 		return nil, fmt.Errorf("error compiling filter regex: %w", err)
 	}
@@ -457,14 +458,37 @@ func executeAndStreamOutput(host string, cmdWithCancel *CmdWithCancel) error {
 	return nil
 }
 
+// sortedHosts returns the host names of configs in sorted order, so host
+// iteration (execution start, tables, logs) is deterministic across runs.
+func sortedHosts(configs Configurations) []string {
+	hosts := make([]string, 0, len(configs))
+	for host := range configs {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
+// failureStatus renders an execution error for the per-host summary,
+// surfacing the remote exit code when there is one.
+func failureStatus(err error) string {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Sprintf("failed (exit %d)", exitErr.ExitCode())
+	}
+	return fmt.Sprintf("failed (%v)", err)
+}
+
 // executeConcurrently runs the given action concurrently on all hosts.
+// If any host fails, a per-host summary with exit codes is printed before
+// returning an error.
 func executeConcurrently(configs Configurations, args []string, username string, parallelism int, action ActionFunc) error {
 	var wg sync.WaitGroup
-	var errorCount int32
-	var errorMutex sync.Mutex
+	resultsChan := make(chan hostResult, len(configs))
 	sem := make(chan struct{}, parallelism)
 
-	for host, cfg := range configs {
+	for _, host := range sortedHosts(configs) {
+		cfg := configs[host]
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(host string, cfg HostConfig) {
@@ -474,37 +498,60 @@ func executeConcurrently(configs Configurations, args []string, username string,
 			cmd, err := action(host, cfg.Deployment.TargetHost, args, username)
 			if err != nil {
 				log.Printf("Error creating command for %s: %v", host, err)
-				errorMutex.Lock()
-				errorCount++
-				errorMutex.Unlock()
+				resultsChan <- hostResult{host, err}
 				return
 			}
 			if cmd == nil {
 				log.Printf("%s: skipping due to nil command", host)
+				resultsChan <- hostResult{host, nil}
 				return
 			}
 
-			if err := executeAndStreamOutput(host, cmd); err != nil {
+			err = executeAndStreamOutput(host, cmd)
+			if err != nil {
 				log.Printf("Error executing command for %s: %v", host, err)
-				errorMutex.Lock()
-				errorCount++
-				errorMutex.Unlock()
 			}
+			resultsChan <- hostResult{host, err}
 		}(host, cfg)
 	}
 
 	wg.Wait()
+	close(resultsChan)
 
-	if errorCount > 0 {
-		return fmt.Errorf("%d command(s) failed", errorCount)
+	errs := make(map[string]error, len(configs))
+	failed := 0
+	for r := range resultsChan {
+		errs[r.host] = r.err
+		if r.err != nil {
+			failed++
+		}
+	}
+
+	if failed > 0 {
+		log.Println("----\nSummary:")
+		for _, host := range sortedHosts(configs) {
+			status := "OK"
+			if err := errs[host]; err != nil {
+				status = failureStatus(err)
+			}
+			log.Printf("%s: %s", host, status)
+		}
+		log.Println("----")
+		return fmt.Errorf("%d command(s) failed", failed)
 	}
 	return nil
+}
+
+type hostResult struct {
+	host string
+	err  error
 }
 
 // printSelectedHosts logs the selected hosts and their configurations.
 func printSelectedHosts(configs Configurations) {
 	log.Println("----\nSelected hosts:")
-	for host, cfg := range configs {
+	for _, host := range sortedHosts(configs) {
+		cfg := configs[host]
 		if cfg.Path != "" {
 			log.Printf("%s -> targetHost: %s, path: %s", host, cfg.Deployment.TargetHost, cfg.Path)
 		} else {
@@ -514,13 +561,24 @@ func printSelectedHosts(configs Configurations) {
 	log.Println("----")
 }
 
+// shellQuote quotes s as a single POSIX shell word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // sshAction builds a command to execute an arbitrary command on the host via SSH.
+// Each argument is shell-quoted so the remote argv matches the local one
+// (ssh joins arguments with spaces and the remote shell re-parses them);
+// shell features need an explicit 'sh -c ...' argument.
 func sshAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
 	baseArgs, err := sshBaseArgs(username, address, true, opts.TrustNewKeys)
 	if err != nil {
 		return nil, err
 	}
-	childArgs := append(baseArgs, args...)
+	childArgs := baseArgs
+	for _, arg := range args {
+		childArgs = append(childArgs, shellQuote(arg))
+	}
 	return newCmd("ssh", childArgs...), nil
 }
 
@@ -535,7 +593,7 @@ func nixosRebuildArgs(host, address, username, action string, extraArgs []string
 	if !isValidHostname(address) {
 		return nil, fmt.Errorf("invalid hostname/address: %s", address)
 	}
-	hostAttr := fmt.Sprintf(".#%s", host)
+	hostAttr := fmt.Sprintf("%s#%s", opts.FlakeRef, host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
 
 	cmdArgs := []string{action}
@@ -573,7 +631,13 @@ func nixosBuildAction(host, address string, args []string, username string) (*Cm
 // applyWithBuild performs the build phase (unless skipped) and then the apply phase.
 // Extra arguments after the action are passed through to nixos-rebuild in
 // both phases.
-func applyWithBuild(configs Configurations, args []string, username string, parallelism int) {
+//
+// Each host runs nixos-rebuild in its own working directory: concurrent
+// runs sharing a cwd race on the ./result out-link, leaving only the
+// last-written host's build GC-rooted between the phases, and litter the
+// flake checkout. Relative paths in pass-through arguments or NIX_SSHOPTS
+// therefore need to be absolute.
+func applyWithBuild(configs Configurations, args []string, username string, parallelism int) error {
 	action := "switch"
 	if len(args) > 0 {
 		action = args[0]
@@ -583,11 +647,40 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 		extraArgs = args[1:]
 	}
 
+	baseDir, err := os.MkdirTemp("", "ninfra-")
+	if err != nil {
+		return fmt.Errorf("failed to create work directory: %w", err)
+	}
+	// For build-style actions the per-host result symlinks are the
+	// deliverable (and its GC root); keep them instead of cleaning up.
+	keepWorkDirs := strings.HasPrefix(action, "build")
+	if !keepWorkDirs {
+		defer os.RemoveAll(baseDir)
+	}
+
+	workDirs := make(map[string]string, len(configs))
+	for i, host := range sortedHosts(configs) {
+		// Index instead of host name: attribute names may contain path separators
+		dir := filepath.Join(baseDir, fmt.Sprintf("host%d", i))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create work directory for %s: %w", host, err)
+		}
+		workDirs[host] = dir
+	}
+	inWorkDir := func(fn ActionFunc) ActionFunc {
+		return func(host, address string, args []string, username string) (*CmdWithCancel, error) {
+			cmd, err := fn(host, address, args, username)
+			if cmd != nil {
+				cmd.Dir = workDirs[host]
+			}
+			return cmd, err
+		}
+	}
+
 	if !opts.SkipBuild {
 		log.Println("Starting build phase on all nodes...")
-		if err := executeConcurrently(configs, extraArgs, username, parallelism, nixosBuildAction); err != nil {
-			log.Println("Build phase failed. Aborting apply phase.")
-			os.Exit(1)
+		if err := executeConcurrently(configs, extraArgs, username, parallelism, inWorkDir(nixosBuildAction)); err != nil {
+			return fmt.Errorf("build phase failed, aborting apply phase: %w", err)
 		}
 		log.Println("Build phase succeeded.")
 	} else {
@@ -597,10 +690,16 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 	log.Println("Starting apply phase...")
 	finalArgs := append([]string{action}, extraArgs...)
 
-	if err := executeConcurrently(configs, finalArgs, username, parallelism, nixosRebuildAction); err != nil {
-		log.Println("Apply phase failed.")
-		os.Exit(1)
+	if err := executeConcurrently(configs, finalArgs, username, parallelism, inWorkDir(nixosRebuildAction)); err != nil {
+		return fmt.Errorf("apply phase failed: %w", err)
 	}
+	if keepWorkDirs {
+		log.Printf("Build results kept under %s:", baseDir)
+		for _, host := range sortedHosts(configs) {
+			log.Printf("%s: %s", host, filepath.Join(workDirs[host], "result"))
+		}
+	}
+	return nil
 }
 
 // compareAction builds the command used to compare system paths.
@@ -634,7 +733,8 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 	resultsChan := make(chan compareResult, len(configs))
 	sem := make(chan struct{}, parallelism)
 
-	for host, cfg := range configs {
+	for _, host := range sortedHosts(configs) {
+		cfg := configs[host]
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(host string, cfg HostConfig) {
@@ -701,7 +801,59 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 	for r := range resultsChan {
 		results = append(results, r)
 	}
+	sort.Slice(results, func(i, j int) bool { return results[i].host < results[j].host })
 	return results
+}
+
+// compareJSON is the machine-readable form of a compareResult.
+type compareJSON struct {
+	Host            string `json:"host"`
+	Expected        string `json:"expected"`
+	CurrentSystem   string `json:"currentSystem,omitempty"`
+	SystemProfile   string `json:"systemProfile,omitempty"`
+	ActiveMatch     bool   `json:"activeMatch"`
+	BootMatch       bool   `json:"bootMatch"`
+	Persisted       bool   `json:"persisted"`
+	Error           string `json:"error,omitempty"`
+	ConnectionError bool   `json:"connectionError,omitempty"`
+}
+
+// printCompareJSON writes the compare results to stdout as JSON.
+// Returns (mismatches, connErrors, remoteErrors) like printCompareTable.
+func printCompareJSON(results []compareResult) (int, int, int) {
+	mismatches := 0
+	connErrors := 0
+	remoteErrors := 0
+	out := make([]compareJSON, 0, len(results))
+	for _, res := range results {
+		j := compareJSON{
+			Host:          res.host,
+			Expected:      res.expected,
+			CurrentSystem: res.currentSystem,
+			SystemProfile: res.systemProfile,
+		}
+		if res.err != nil {
+			j.Error = res.err.Error()
+			j.ConnectionError = res.connErr
+			if res.connErr {
+				connErrors++
+			} else {
+				remoteErrors++
+			}
+		} else {
+			j.ActiveMatch = res.currentSystem == res.expected
+			j.BootMatch = res.systemProfile == res.expected
+			j.Persisted = res.currentSystem == res.systemProfile
+			if !j.ActiveMatch || !j.BootMatch {
+				mismatches++
+			}
+		}
+		out = append(out, j)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+		log.Printf("Error encoding JSON output: %v", err)
+	}
+	return mismatches, connErrors, remoteErrors
 }
 
 // printCompareVerbose outputs a detailed comparison report.
@@ -776,6 +928,7 @@ func main() {
 
 	// Set default values.
 	opts = Options{
+		FlakeRef:        ".",
 		ListHostsExpr:   DefaultListHostsExpr,
 		DeploymentExpr:  DefaultDeploymentExpr,
 		ClosurePathExpr: DefaultClosurePathExpr,
@@ -783,6 +936,7 @@ func main() {
 		TrustNewKeys:    true,
 		UseSubstitutes:  true,
 		Verbose:         false,
+		JSONOutput:      false,
 		Timeout:         0,
 		ConnectTimeout:  10,
 		Username:        os.Getenv("USER"),
@@ -791,11 +945,13 @@ func main() {
 	}
 
 	// Define flags.
-	flag.StringVar(&opts.Filter, "on", opts.Filter, "Set the filter to apply")
+	flag.StringVar(&opts.FlakeRef, "flake", opts.FlakeRef, "Flake to read nixosConfigurations from (path or flake reference)")
+	flag.BoolVar(&opts.JSONOutput, "json", opts.JSONOutput, "Output compare results as JSON")
+	flag.StringVar(&opts.Filter, "on", opts.Filter, "Regex to select hosts by name (anchored: must match the whole name)")
 	flag.StringVar(&opts.Username, "l", opts.Username, "Specify the username for the target host")
 	flag.IntVar(&opts.Parallelism, "P", opts.Parallelism, "Specify the number of parallel jobs")
 	flag.IntVar(&opts.ConnectTimeout, "c", opts.ConnectTimeout, "SSH connection timeout in seconds")
-	flag.StringVar(&opts.ListHostsExpr, "list-hosts-expr", opts.ListHostsExpr, "Nix expression to list hosts (applied to .#nixosConfigurations)")
+	flag.StringVar(&opts.ListHostsExpr, "list-hosts-expr", opts.ListHostsExpr, "Nix expression to list hosts (applied to the flake's nixosConfigurations)")
 	flag.StringVar(&opts.DeploymentExpr, "deployment-expr", opts.DeploymentExpr, "Nix expression to extract deployment info")
 	flag.StringVar(&opts.ClosurePathExpr, "closure-path-expr", opts.ClosurePathExpr, "Nix expression to extract system path")
 	flag.BoolVar(&opts.SkipBuild, "fast", opts.SkipBuild, "Skip the initial build phase")
@@ -844,9 +1000,43 @@ Arguments:
 	}
 	args = flag.CommandLine.Args()
 
-	// Validate parallelism parameter
+	// Validate cheap things before any nix evaluation.
+	switch subcommand {
+	case "exec", "apply", "compare":
+	default:
+		fmt.Fprintf(os.Stderr, "Error: Unknown subcommand '%s'.\n", subcommand)
+		flag.Usage()
+		os.Exit(1)
+	}
+	if subcommand == "exec" && len(args) < 1 {
+		log.Fatal("Error: No command specified for exec.")
+	}
+	if opts.Username == "" {
+		log.Fatal("Error: no SSH username (USER is unset); specify one with -l.")
+	}
 	if opts.Parallelism <= 0 {
 		log.Fatalf("Parallelism must be greater than 0, got: %d", opts.Parallelism)
+	}
+
+	// Resolve a plain local path to an absolute one so nixos-rebuild still
+	// finds the flake when run from per-host working directories. Only refs
+	// that syntactically look like paths are resolved - a bare name like
+	// 'nixpkgs' stays a registry reference even if a directory of that name
+	// exists, matching nix's own interpretation.
+	if opts.FlakeRef == "." || opts.FlakeRef == ".." ||
+		strings.HasPrefix(opts.FlakeRef, "/") ||
+		strings.HasPrefix(opts.FlakeRef, "./") ||
+		strings.HasPrefix(opts.FlakeRef, "../") {
+		abs, err := filepath.Abs(opts.FlakeRef)
+		if err != nil {
+			log.Fatalf("Error resolving flake path %q: %v", opts.FlakeRef, err)
+		}
+		// The path is later concatenated as <ref>#<attr>; nix splits the
+		// installable at the first '#' and parses '?' as query parameters
+		if strings.ContainsAny(abs, "#?") {
+			log.Fatalf("Error: flake path %q contains '#' or '?' and cannot be used as a flake reference", abs)
+		}
+		opts.FlakeRef = abs
 	}
 
 	// Build NIX_SSHOPTS for nixos-rebuild's SSH connections, preserving
@@ -864,8 +1054,9 @@ Arguments:
 	}
 	os.Setenv("NIX_SSHOPTS", strings.Join(sshOpts, " "))
 
-	// Determine if we need closure paths based on the subcommand
-	needsClosurePath := subcommand == "apply" || subcommand == "compare"
+	// Only compare consumes closure paths; apply lets nixos-rebuild do its
+	// own evaluation, so skipping the eval here halves its startup cost.
+	needsClosurePath := subcommand == "compare"
 
 	configs, err := parseConfigurations(needsClosurePath)
 	if err != nil {
@@ -879,9 +1070,6 @@ Arguments:
 
 	switch subcommand {
 	case "exec":
-		if len(args) < 1 {
-			log.Fatal("Error: No command specified for exec.")
-		}
 		if err := executeConcurrently(configs, args, opts.Username, opts.Parallelism, sshAction); err != nil {
 			log.Fatal(err)
 		}
@@ -890,17 +1078,23 @@ Arguments:
 			log.Println("Single target node, implicitly skipping separate build phase.")
 			opts.SkipBuild = true
 		}
-		applyWithBuild(configs, args, opts.Username, opts.Parallelism)
+		if err := applyWithBuild(configs, args, opts.Username, opts.Parallelism); err != nil {
+			log.Fatal(err)
+		}
 	case "compare":
 		results := getCompareResults(configs, opts.Username, opts.Parallelism)
 
-		// Always show the comparison table (includes errors per host)
-		tableMismatches, connErrors, remoteErrors := printCompareTable(results)
+		var tableMismatches, connErrors, remoteErrors int
+		if opts.JSONOutput {
+			tableMismatches, connErrors, remoteErrors = printCompareJSON(results)
+		} else {
+			tableMismatches, connErrors, remoteErrors = printCompareTable(results)
 
-		// If verbose mode is on, also show the detailed report
-		if opts.Verbose {
-			fmt.Println() // Add spacing between table and verbose output
-			printCompareVerbose(results)
+			// If verbose mode is on, also show the detailed report
+			if opts.Verbose {
+				fmt.Println() // Add spacing between table and verbose output
+				printCompareVerbose(results)
+			}
 		}
 
 		// Print appropriate message based on what failed
@@ -915,12 +1109,12 @@ Arguments:
 			problems = append(problems, fmt.Sprintf("%d host(s) with remote errors", remoteErrors))
 		}
 		if len(problems) > 0 {
-			fmt.Printf("\nFound %s.\n", strings.Join(problems, ", "))
+			// Keep stdout pure JSON in -json mode; the exit code and the
+			// per-host error fields carry the same information
+			if !opts.JSONOutput {
+				fmt.Printf("\nFound %s.\n", strings.Join(problems, ", "))
+			}
 			os.Exit(1)
 		}
-	default:
-		fmt.Printf("Error: Unknown subcommand '%s'.\n", subcommand)
-		flag.Usage()
-		os.Exit(1)
 	}
 }

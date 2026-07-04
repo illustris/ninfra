@@ -17,22 +17,23 @@ ninfra [options] <subcommand> [options] [arguments]
 
 Options may be given before or after the subcommand. Option parsing stops at the first non-option argument, so for `exec`, ninfra options must come before the command to execute.
 
-ninfra must be run from the root of the flake containing your `nixosConfigurations`; all evaluation uses the flake in the current directory (`.#`).
+By default ninfra reads `nixosConfigurations` from the flake in the current directory; use `--flake <path or flake reference>` to point at another flake. Local paths are resolved to absolute paths, so ninfra works from any directory.
 
 ### Subcommands
 
-- **exec**: Execute a command on the specified hosts.
-- **apply**: Perform a NixOS rebuild action (`nixos-rebuild`) on the specified hosts.
+- **exec**: Execute a command on the specified hosts. Arguments are shell-quoted so the remote argv matches what you typed locally; to use shell features (pipes, globs, variables), pass them through an explicit shell: `ninfra exec sh -c 'systemctl list-units | grep failed'`.
+- **apply**: Perform a NixOS rebuild action (`nixos-rebuild`) on the specified hosts. Each host builds in its own temporary working directory, so parallel applies cannot race on a shared `result` symlink and your flake checkout stays clean; for build-style actions the per-host `result` symlinks are kept and their locations printed. Because of this, relative paths in pass-through arguments or `NIX_SSHOPTS` must be absolute.
 - **compare**: Compare the deployed system paths with the configured paths from the flake. Exits non-zero if any host mismatches, cannot be reached (`Connection failed`), or fails the remote check (`Remote error`).
 
 ### Options
 
 #### Common Options
 
-- `--on <filter>`: Apply a regex filter to target specific hosts (default: `.*`).
+- `--on <filter>`: Regex to select hosts by name (default: `.*`). The pattern is anchored and must match the whole name: `--on web1` matches only the host `web1`, not `web10`; use `--on 'web1.*'` for prefix matching.
+- `--flake <ref>`: Flake to read `nixosConfigurations` from (default: the current directory). Plain paths (`.`, `./infra`, `/srv/infra`) are resolved to absolute paths; anything else (registry names, `github:...` URLs) is passed to nix as-is. URL-style refs with relative paths (`path:./x`, `git+file:./x`) are not supported.
 - `-l <username>`: Specify the username for the target hosts (default: current user).
 - `-P <parallelism>`: Set the number of parallel jobs (default: `1`).
-- `--timeout <duration>`: Timeout for remote commands (e.g., `5m`, `1m`).
+- `--timeout <duration>`: Timeout for remote commands (e.g., `5m`, `1m`; default: disabled).
 - `-h`, `--help`: Display usage information.
 
 #### SSH Options
@@ -50,10 +51,11 @@ All SSH connections run with `BatchMode=yes`, so authentication failures fail fa
 #### Compare Options
 
 - `-v`: Enable verbose output showing detailed comparison report.
+- `-json`: Output results as JSON on stdout (for CI/monitoring); exit-code semantics are unchanged and human messages stay off stdout. The match fields are only meaningful when `error` is unset.
 
 #### Advanced Options
 
-- `--list-hosts-expr <expr>`: Nix expression to list hosts (applied to `.#nixosConfigurations`).
+- `--list-hosts-expr <expr>`: Nix expression to list hosts (applied to the flake's `nixosConfigurations`).
 - `--deployment-expr <expr>`: Nix expression to extract deployment info.
 - `--closure-path-expr <expr>`: Nix expression to extract system path.
 
