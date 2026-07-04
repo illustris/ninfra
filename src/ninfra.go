@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -43,18 +42,18 @@ var (
 
 // Options contains configuration flags and settings.
 type Options struct {
-	ListHostsExpr     string
-	DeploymentExpr    string
-	ClosurePathExpr   string
-	SkipBuild         bool
-	TrustNewKeys      bool
-	UseSubstitutes    bool
-	Verbose           bool
-	Timeout           time.Duration
-	ConnectTimeout    int
-	Username          string
-	Parallelism       int
-	Filter            string
+	ListHostsExpr   string
+	DeploymentExpr  string
+	ClosurePathExpr string
+	SkipBuild       bool
+	TrustNewKeys    bool
+	UseSubstitutes  bool
+	Verbose         bool
+	Timeout         time.Duration
+	ConnectTimeout  int
+	Username        string
+	Parallelism     int
+	Filter          string
 }
 
 var opts Options
@@ -81,7 +80,7 @@ func isValidHostname(hostname string) bool {
 	// Basic validation - no shell metacharacters
 	for _, r := range hostname {
 		if !unicode.IsLetter(r) && !unicode.IsDigit(r) &&
-		   r != '-' && r != '.' && r != ':' && r != '[' && r != ']' {
+			r != '-' && r != '.' && r != ':' && r != '[' && r != ']' {
 			return false
 		}
 	}
@@ -113,13 +112,29 @@ func getHostsList() ([]string, error) {
 	return hosts, nil
 }
 
+// nixQuoteString renders s as a Nix double-quoted string literal.
+func nixQuoteString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "${", `\${`)
+	return `"` + s + `"`
+}
+
+// hostApplyExpr wraps a per-host expression so it can be applied to the
+// whole nixosConfigurations set. Selecting the host with builtins.getAttr
+// (instead of interpolating it into the CLI attrpath) works for any
+// attribute name, including dotted FQDN-style names; the Nix CLI attrpath
+// syntax cannot represent quotes or backslashes at all.
+func hostApplyExpr(expr, host string) string {
+	return fmt.Sprintf("cfgs: (%s) (builtins.getAttr %s cfgs)", expr, nixQuoteString(host))
+}
+
 // getHostDeploymentInfo gets deployment information for a specific host
 func getHostDeploymentInfo(host string) (DeploymentInfo, error) {
 	var deploymentInfo DeploymentInfo
 
-	cmd := exec.Command("nix", "eval", "--json",
-		fmt.Sprintf(".#nixosConfigurations.%s", host),
-		"--apply", opts.DeploymentExpr)
+	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations",
+		"--apply", hostApplyExpr(opts.DeploymentExpr, host))
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -141,9 +156,8 @@ func getHostDeploymentInfo(host string) (DeploymentInfo, error) {
 func getHostClosurePath(host string) (string, error) {
 	var path string
 
-	cmd := exec.Command("nix", "eval", "--json",
-		fmt.Sprintf(".#nixosConfigurations.%s", host),
-		"--apply", opts.ClosurePathExpr)
+	cmd := exec.Command("nix", "eval", "--json", ".#nixosConfigurations",
+		"--apply", hostApplyExpr(opts.ClosurePathExpr, host))
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -333,7 +347,12 @@ func sshBaseArgs(username, address string, addSeparator bool, trustNewKeys bool)
 	}
 
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
-	args := []string{}
+	// BatchMode makes authentication failures fail fast instead of hanging
+	// on a hidden interactive password prompt.
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", opts.ConnectTimeout),
+	}
 	if trustNewKeys {
 		args = append(args, "-o", "StrictHostKeyChecking=accept-new")
 	}
@@ -356,65 +375,80 @@ type CmdWithCancel struct {
 // newCmd creates an exec.Cmd, attaching a timeout if one is set.
 // Returns a CmdWithCancel that includes the cancel function for proper cleanup.
 func newCmd(name string, args ...string) *CmdWithCancel {
+	var cmd *exec.Cmd
+	cancel := context.CancelFunc(func() {}) // No-op cancel for non-timeout commands
 	if opts.Timeout > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
-		return &CmdWithCancel{
-			Cmd:    exec.CommandContext(ctx, name, args...),
-			Cancel: cancel,
-		}
+		var ctx context.Context
+		ctx, cancel = context.WithTimeout(context.Background(), opts.Timeout)
+		cmd = exec.CommandContext(ctx, name, args...)
+	} else {
+		cmd = exec.Command(name, args...)
 	}
-	return &CmdWithCancel{
-		Cmd:    exec.Command(name, args...),
-		Cancel: func() {}, // No-op cancel for non-timeout commands
+	// Bound the time Wait blocks on stdio after the child exits or the
+	// timeout fires; otherwise descendants (e.g. ssh spawned by
+	// nixos-rebuild) inheriting the pipe write ends can hang the run forever.
+	cmd.WaitDelay = 10 * time.Second
+	return &CmdWithCancel{Cmd: cmd, Cancel: cancel}
+}
+
+// lineWriter is an io.Writer that logs each complete line with a prefix.
+// Unlike bufio.Scanner it has no maximum line length; a partial trailing
+// line is emitted by Flush.
+type lineWriter struct {
+	prefix string
+	buf    bytes.Buffer
+}
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	w.buf.Write(p)
+	for {
+		i := bytes.IndexByte(w.buf.Bytes(), '\n')
+		if i < 0 {
+			break
+		}
+		line := w.buf.Next(i + 1)
+		log.Printf("%s%s", w.prefix, bytes.TrimRight(line, "\r\n"))
+	}
+	// Bound memory when a stream never emits newlines (e.g. binary output):
+	// flush oversized partial lines in chunks instead of buffering forever.
+	if w.buf.Len() > lineWriterFlushLimit {
+		w.Flush()
+	}
+	return len(p), nil
+}
+
+// lineWriterFlushLimit caps how much of a newline-free stream lineWriter
+// buffers before flushing it as a partial line.
+const lineWriterFlushLimit = 1 << 20
+
+func (w *lineWriter) Flush() {
+	if w.buf.Len() > 0 {
+		log.Printf("%s%s", w.prefix, bytes.TrimRight(w.buf.Bytes(), "\r\n"))
+		w.buf.Reset()
 	}
 }
 
 // executeAndStreamOutput streams stdout and stderr for the given command.
+// The exec package drains both streams concurrently, so combined with the
+// WaitDelay set in newCmd a full pipe buffer cannot deadlock the run.
 func executeAndStreamOutput(host string, cmdWithCancel *CmdWithCancel) error {
 	defer cmdWithCancel.Cancel() // Ensure context is properly cleaned up
 	cmd := cmdWithCancel.Cmd
-	stdoutPipe, err := cmd.StdoutPipe()
+	stdout := &lineWriter{prefix: host + ": "}
+	stderr := &lineWriter{prefix: host + " (stderr): "}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	err := cmd.Run()
+	stdout.Flush()
+	stderr.Flush()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The command exited successfully but something (e.g. an ssh
+		// descendant) kept its stdio open past WaitDelay.
+		log.Printf("%s: command exited but left stdio open; trailing output may be lost", host)
+		return nil
+	}
 	if err != nil {
-		return fmt.Errorf("%s: failed to get stdout pipe: %w", host, err)
-	}
-
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("%s: failed to get stderr pipe: %w", host, err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%s: failed to start command: %w", host, err)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			log.Printf("%s: %s", host, scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("%s: error reading stdout: %v", host, err)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			log.Printf("%s (stderr): %s", host, scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("%s: error reading stderr: %v", host, err)
-		}
-	}()
-
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("%s: command finished with error: %w", host, err)
 	}
 	return nil
@@ -487,56 +521,78 @@ func sshAction(host, address string, args []string, username string) (*CmdWithCa
 	return newCmd("ssh", childArgs...), nil
 }
 
-// nixosRebuildAction builds the command for a nixos-rebuild action (apply phase).
-func nixosRebuildAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
+// nixosRebuildArgs builds the argument list for a nixos-rebuild invocation.
+// The host attribute is passed unquoted: nixos-rebuild quotes the flake
+// attribute itself, so pre-quoting here would break it.
+// extraArgs are passed through to nixos-rebuild verbatim.
+func nixosRebuildArgs(host, address, username, action string, extraArgs []string) ([]string, error) {
+	if !isValidUsername(username) {
+		return nil, fmt.Errorf("invalid username: %s", username)
+	}
+	if !isValidHostname(address) {
+		return nil, fmt.Errorf("invalid hostname/address: %s", address)
+	}
 	hostAttr := fmt.Sprintf(".#%s", host)
 	sshTarget := fmt.Sprintf("%s@%s", username, address)
+
+	cmdArgs := []string{action}
+	if opts.UseSubstitutes {
+		cmdArgs = append(cmdArgs, "--use-substitutes")
+	}
+	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTarget)
+	cmdArgs = append(cmdArgs, extraArgs...)
+	return cmdArgs, nil
+}
+
+// nixosRebuildAction builds the command for a nixos-rebuild action (apply phase).
+func nixosRebuildAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
 	if len(args) == 0 {
 		args = []string{"switch"}
 	}
-
-	// Build command arguments with --use-substitutes if enabled.
-	cmdArgs := []string{args[0]}
-	if opts.UseSubstitutes {
-		cmdArgs = append(cmdArgs, "--use-substitutes")
+	cmdArgs, err := nixosRebuildArgs(host, address, username, args[0], args[1:])
+	if err != nil {
+		return nil, err
 	}
-	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTarget)
 	return newCmd("nixos-rebuild", cmdArgs...), nil
 }
 
-// nixosBuildAction builds the command for the build phase.
-func nixosBuildAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
-	hostAttr := fmt.Sprintf(".#%s", host)
-	sshTarget := fmt.Sprintf("%s@%s", username, address)
-	cmdArgs := []string{"build"}
-	if opts.UseSubstitutes {
-		cmdArgs = append(cmdArgs, "--use-substitutes")
+// nixosBuildAction builds the command for the build phase. args are extra
+// user-supplied arguments passed through to nixos-rebuild, same as in the
+// apply phase.
+func nixosBuildAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
+	cmdArgs, err := nixosRebuildArgs(host, address, username, "build", args)
+	if err != nil {
+		return nil, err
 	}
-	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTarget)
 	return newCmd("nixos-rebuild", cmdArgs...), nil
 }
 
 // applyWithBuild performs the build phase (unless skipped) and then the apply phase.
+// Extra arguments after the action are passed through to nixos-rebuild in
+// both phases.
 func applyWithBuild(configs Configurations, args []string, username string, parallelism int) {
-	if !opts.SkipBuild {
-		log.Println("Starting build phase on all nodes...")
-		if err := executeConcurrently(configs, nil, username, parallelism, nixosBuildAction); err != nil {
-			log.Println("Build phase failed. Aborting apply phase.")
-			os.Exit(1)
-		}
-	} else {
-		log.Println("Skipping build phase due to --fast flag.")
-	}
-
-	log.Println("Build phase succeeded. Starting apply phase...")
 	action := "switch"
 	if len(args) > 0 {
 		action = args[0]
 	}
-	finalArgs := []string{action}
+	var extraArgs []string
 	if len(args) > 1 {
-		finalArgs = append(finalArgs, args[1:]...)
+		extraArgs = args[1:]
 	}
+
+	if !opts.SkipBuild {
+		log.Println("Starting build phase on all nodes...")
+		if err := executeConcurrently(configs, extraArgs, username, parallelism, nixosBuildAction); err != nil {
+			log.Println("Build phase failed. Aborting apply phase.")
+			os.Exit(1)
+		}
+		log.Println("Build phase succeeded.")
+	} else {
+		log.Println("Skipping build phase.")
+	}
+
+	log.Println("Starting apply phase...")
+	finalArgs := append([]string{action}, extraArgs...)
 
 	if err := executeConcurrently(configs, finalArgs, username, parallelism, nixosRebuildAction); err != nil {
 		log.Println("Apply phase failed.")
@@ -546,19 +602,11 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 
 // compareAction builds the command used to compare system paths.
 func compareAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
-	// For the compare command, we handle SSH errors more explicitly to show the user why connections failed
-	sshTarget := fmt.Sprintf("%s@%s", username, address)
-
-	// Build the SSH command with options from the environment plus our basic options
-	args := []string{
-		// Add connection timeout to avoid hanging on network issues
-		"-o", fmt.Sprintf("ConnectTimeout=%d", opts.ConnectTimeout),
+	baseArgs, err := sshBaseArgs(username, address, true, opts.TrustNewKeys)
+	if err != nil {
+		return nil, err
 	}
-
-	if opts.TrustNewKeys {
-		args = append(args, "-o", "StrictHostKeyChecking=accept-new")
-	}
-	args = append(args, sshTarget, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
+	args := append(baseArgs, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
 
 	// Debug log the command only in verbose mode
 	if opts.Verbose {
@@ -570,32 +618,11 @@ func compareAction(host, address string, _ []string, username string) (*CmdWithC
 
 type compareResult struct {
 	host          string
-	expected      string  // The expected path from the nix evaluation
-	currentSystem string  // Path from /run/current-system
-	systemProfile string  // Path from /nix/var/nix/profiles/system
+	expected      string // The expected path from the nix evaluation
+	currentSystem string // Path from /run/current-system
+	systemProfile string // Path from /nix/var/nix/profiles/system
+	connErr       bool   // err is an SSH transport/connection failure rather than a remote one
 	err           error
-}
-
-// createErrorResult is a helper function to create a compareResult with an error
-func createErrorResult(host, expected string, errMsg string, err error) compareResult {
-	return compareResult{
-		host:     host,
-		expected: expected,
-		err:      fmt.Errorf("%s: %w", errMsg, err),
-	}
-}
-
-// readCommandOutput reads all output from a pipe and returns it as a string
-func readCommandOutput(pipe io.Reader) (string, error) {
-	var buffer bytes.Buffer
-	scanner := bufio.NewScanner(pipe)
-	for scanner.Scan() {
-		buffer.WriteString(scanner.Text() + "\n")
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return buffer.String(), nil
 }
 
 // getCompareResults collects the compare results from all hosts.
@@ -611,70 +638,54 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			cmdWithCancel, err := compareAction(host, cfg.Deployment.TargetHost, nil, username)
-			if err != nil {
-				resultsChan <- compareResult{
-					host:     host,
-					expected: cfg.Path,
-					err:      fmt.Errorf("failed to create command: %w", err),
-				}
-				return
-			}
-			defer cmdWithCancel.Cancel() // Ensure context cleanup
-			cmd := cmdWithCancel.Cmd
-
-			// Get stdout and stderr separately
-			stdoutPipe, err := cmd.StdoutPipe()
-			if err != nil {
-				resultsChan <- createErrorResult(host, cfg.Path, "failed to get stdout pipe", err)
-				return
-			}
-
-			stderrPipe, err := cmd.StderrPipe()
-			if err != nil {
-				resultsChan <- createErrorResult(host, cfg.Path, "failed to get stderr pipe", err)
-				return
-			}
-
-			// Start the command
-			if err := cmd.Start(); err != nil {
-				resultsChan <- createErrorResult(host, cfg.Path, "failed to start command", err)
-				return
-			}
-
-			// Read stdout and stderr
-			stdoutStr, err := readCommandOutput(stdoutPipe)
-			if err != nil {
-				resultsChan <- createErrorResult(host, cfg.Path, "error reading stdout", err)
-				return
-			}
-
-			stderrStr, err := readCommandOutput(stderrPipe)
-			if err != nil {
-				resultsChan <- createErrorResult(host, cfg.Path, "error reading stderr", err)
-				return
-			}
-
-			// Wait for command to finish
-			err = cmd.Wait()
 			res := compareResult{
 				host:     host,
 				expected: cfg.Path,
 			}
 
+			cmdWithCancel, err := compareAction(host, cfg.Deployment.TargetHost, nil, username)
 			if err != nil {
-				res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderrStr)
+				res.connErr = true
+				res.err = fmt.Errorf("failed to create command: %w", err)
+				resultsChan <- res
+				return
+			}
+			defer cmdWithCancel.Cancel() // Ensure context cleanup
+			cmd := cmdWithCancel.Cmd
+
+			// Capture stdout and stderr separately; the exec package drains
+			// both streams concurrently, so a large stderr cannot deadlock
+			// the run the way sequential pipe reads could.
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			err = cmd.Run()
+			if errors.Is(err, exec.ErrWaitDelay) {
+				// Successful exit, but stdio was held open past WaitDelay.
+				err = nil
+			}
+			if err != nil {
+				// ssh exits 255 on connection/authentication failure; any
+				// other positive exit code comes from the remote command.
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 && exitErr.ExitCode() != 255 {
+					res.err = fmt.Errorf("remote command failed: %w, stderr: \n%s", err, stderr.String())
+				} else {
+					res.connErr = true
+					res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderr.String())
+				}
 				resultsChan <- res
 				return
 			}
 
 			// Only process stdout for paths
-			lines := strings.Split(strings.TrimSpace(stdoutStr), "\n")
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 			if len(lines) >= 2 {
 				res.currentSystem = strings.TrimSpace(lines[0])
 				res.systemProfile = strings.TrimSpace(lines[1])
 			} else {
-				res.err = fmt.Errorf("realpath command didn't return the expected two path lines, got: %s", stdoutStr)
+				res.err = fmt.Errorf("realpath command didn't return the expected two path lines, got: %s", stdout.String())
 			}
 			resultsChan <- res
 		}(host, cfg)
@@ -715,15 +726,22 @@ func printCompareVerbose(results []compareResult) {
 }
 
 // printCompareTable outputs a summary table of the comparison.
-// Returns (mismatches, sshErrors)
-func printCompareTable(results []compareResult) (int, int) {
+// Returns (mismatches, connErrors, remoteErrors)
+func printCompareTable(results []compareResult) (int, int, int) {
 	mismatches := 0
-	sshErrors := 0
+	connErrors := 0
+	remoteErrors := 0
 	fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", "HOST", "ACTIVE", "BOOT", "PERSISTED", "STATUS")
 	for _, res := range results {
 		if res.err != nil {
-			sshErrors++
-			fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, "ERR", "ERR", "ERR", "Connection failed")
+			status := "Remote error"
+			if res.connErr {
+				status = "Connection failed"
+				connErrors++
+			} else {
+				remoteErrors++
+			}
+			fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, "ERR", "ERR", "ERR", status)
 			continue
 		}
 
@@ -746,7 +764,7 @@ func printCompareTable(results []compareResult) (int, int) {
 
 		fmt.Printf("%-20s %-7s %-7s %-10s %-30s\n", res.host, active, boot, persisted, status)
 	}
-	return mismatches, sshErrors
+	return mismatches, connErrors, remoteErrors
 }
 
 func main() {
@@ -784,22 +802,26 @@ func main() {
 	flag.DurationVar(&opts.Timeout, "timeout", opts.Timeout, "Timeout for remote commands (e.g. 5m, 1m)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage: %s <subcommand> [options] [arguments]
+		fmt.Fprintf(os.Stderr, `Usage: %s [options] <subcommand> [options] [arguments]
 
 Subcommands:
   exec               Execute a command on the specified hosts
   apply              Perform nixos-rebuild on the specified hosts
   compare            Compare resolved system paths with the configured path
 
+Options may be given before or after the subcommand. Option parsing stops at
+the first non-option argument, so for exec, options must come before the
+command to execute.
+
 Options:
 `, os.Args[0])
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, `
 Arguments:
-  For exec:   Any command to execute on the target hosts
-  For apply:  An optional positional argument to specify the action (default: switch)
-  For compare:No additional arguments required
-`)
+  For exec:    Any command to execute on the target hosts
+  For apply:   An optional action (default: switch). Extra arguments after
+               an explicitly named action are passed through to nixos-rebuild
+  For compare: No additional arguments required`)
 	}
 
 	flag.Parse()
@@ -810,35 +832,54 @@ Arguments:
 	}
 	subcommand := args[0]
 
+	// Parse flags again after the subcommand so that both
+	// 'ninfra -l root apply' and 'ninfra apply -l root' work. Parsing stops
+	// at the first non-flag argument, so an exec command line and extra
+	// apply arguments are left untouched.
+	if err := flag.CommandLine.Parse(args[1:]); err != nil {
+		os.Exit(2)
+	}
+	args = flag.CommandLine.Args()
+
 	// Validate parallelism parameter
 	if opts.Parallelism <= 0 {
 		log.Fatalf("Parallelism must be greater than 0, got: %d", opts.Parallelism)
 	}
 
-	// Set the environment variable used by nixos-rebuild.
-	if opts.TrustNewKeys {
-		os.Setenv("NIX_SSHOPTS", "-o StrictHostKeyChecking=accept-new")
+	// Build NIX_SSHOPTS for nixos-rebuild's SSH connections, preserving
+	// anything the user already set. User-supplied options come first, and
+	// ssh honors the first occurrence of an option, so they take precedence.
+	sshOpts := []string{
+		"-o BatchMode=yes",
+		fmt.Sprintf("-o ConnectTimeout=%d", opts.ConnectTimeout),
 	}
+	if opts.TrustNewKeys {
+		sshOpts = append(sshOpts, "-o StrictHostKeyChecking=accept-new")
+	}
+	if existing := os.Getenv("NIX_SSHOPTS"); existing != "" {
+		sshOpts = append([]string{existing}, sshOpts...)
+	}
+	os.Setenv("NIX_SSHOPTS", strings.Join(sshOpts, " "))
 
 	// Determine if we need closure paths based on the subcommand
-	needsClosurePath := false
-	if len(args) > 0 && (args[0] == "apply" || args[0] == "compare") {
-		needsClosurePath = true
-	}
+	needsClosurePath := subcommand == "apply" || subcommand == "compare"
 
 	configs, err := parseConfigurations(needsClosurePath)
 	if err != nil {
 		log.Fatalf("Error parsing configurations: %v", err)
+	}
+	if len(configs) == 0 {
+		log.Fatalf("Error: no deployable hosts: all hosts matching --on %q were excluded (see messages above)", opts.Filter)
 	}
 
 	printSelectedHosts(configs)
 
 	switch subcommand {
 	case "exec":
-		if len(args) < 2 {
+		if len(args) < 1 {
 			log.Fatal("Error: No command specified for exec.")
 		}
-		if err := executeConcurrently(configs, args[1:], opts.Username, opts.Parallelism, sshAction); err != nil {
+		if err := executeConcurrently(configs, args, opts.Username, opts.Parallelism, sshAction); err != nil {
 			log.Fatal(err)
 		}
 	case "apply":
@@ -846,12 +887,12 @@ Arguments:
 			log.Println("Single target node, implicitly skipping separate build phase.")
 			opts.SkipBuild = true
 		}
-		applyWithBuild(configs, args[1:], opts.Username, opts.Parallelism)
+		applyWithBuild(configs, args, opts.Username, opts.Parallelism)
 	case "compare":
 		results := getCompareResults(configs, opts.Username, opts.Parallelism)
 
-		// Always show the comparison table (includes SSH errors as connection failures)
-		tableMismatches, sshErrors := printCompareTable(results)
+		// Always show the comparison table (includes errors per host)
+		tableMismatches, connErrors, remoteErrors := printCompareTable(results)
 
 		// If verbose mode is on, also show the detailed report
 		if opts.Verbose {
@@ -860,14 +901,18 @@ Arguments:
 		}
 
 		// Print appropriate message based on what failed
-		if sshErrors > 0 && tableMismatches > 0 {
-			fmt.Printf("\nFound %d host(s) with mismatches and %d host(s) with connection errors.\n", tableMismatches, sshErrors)
-			os.Exit(1)
-		} else if sshErrors > 0 {
-			fmt.Printf("\nFound %d host(s) with connection errors.\n", sshErrors)
-			os.Exit(1)
-		} else if tableMismatches > 0 {
-			fmt.Printf("\nFound %d host(s) with mismatches.\n", tableMismatches)
+		var problems []string
+		if tableMismatches > 0 {
+			problems = append(problems, fmt.Sprintf("%d host(s) with mismatches", tableMismatches))
+		}
+		if connErrors > 0 {
+			problems = append(problems, fmt.Sprintf("%d host(s) with connection errors", connErrors))
+		}
+		if remoteErrors > 0 {
+			problems = append(problems, fmt.Sprintf("%d host(s) with remote errors", remoteErrors))
+		}
+		if len(problems) > 0 {
+			fmt.Printf("\nFound %s.\n", strings.Join(problems, ", "))
 			os.Exit(1)
 		}
 	default:

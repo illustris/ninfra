@@ -12,14 +12,18 @@
 ## Usage
 
 ```bash
-ninfra <subcommand> [options] [arguments]
+ninfra [options] <subcommand> [options] [arguments]
 ```
+
+Options may be given before or after the subcommand. Option parsing stops at the first non-option argument, so for `exec`, ninfra options must come before the command to execute.
+
+ninfra must be run from the root of the flake containing your `nixosConfigurations`; all evaluation uses the flake in the current directory (`.#`).
 
 ### Subcommands
 
 - **exec**: Execute a command on the specified hosts.
 - **apply**: Perform a NixOS rebuild action (`nixos-rebuild`) on the specified hosts.
-- **compare**: Compare the deployed system paths with the configured paths from the flake.
+- **compare**: Compare the deployed system paths with the configured paths from the flake. Exits non-zero if any host mismatches, cannot be reached (`Connection failed`), or fails the remote check (`Remote error`).
 
 ### Options
 
@@ -34,7 +38,9 @@ ninfra <subcommand> [options] [arguments]
 #### SSH Options
 
 - `--trust-new-keys`: Automatically trust new server keys (default: `true`).
-- `-c <seconds>`: SSH connection timeout in seconds (default: `10`).
+- `-c <seconds>`: SSH connection timeout in seconds, applied to all SSH connections including the ones nixos-rebuild makes (default: `10`).
+
+All SSH connections run with `BatchMode=yes`, so authentication failures fail fast instead of prompting for a password. For the `apply` build/rebuild phases, ninfra passes its SSH options to `nixos-rebuild` via `NIX_SSHOPTS`; anything you already have in `NIX_SSHOPTS` (e.g. `ProxyJump`, ports, identity files) is preserved and takes precedence.
 
 #### Apply Options
 
@@ -54,5 +60,7 @@ ninfra <subcommand> [options] [arguments]
 ### Arguments
 
 - **exec**: Provide the command to execute on the target hosts.
-- **apply**: Specify the rebuild action (`switch`, `boot`, etc.) and optional additional arguments.
+- **apply**: Specify the rebuild action (`switch`, `boot`, etc.); any further arguments (e.g. `--install-bootloader`, `--show-trace`) are passed through to `nixos-rebuild` in both the build and apply phases. Passing extra arguments requires naming the action explicitly first: `ninfra apply switch --show-trace`.
 - **compare**: No additional arguments required.
+
+If every host matching the `--on` filter is excluded (for example because it has no `deployment.targetHost`), ninfra exits with an error instead of silently doing nothing.
