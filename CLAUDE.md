@@ -32,7 +32,7 @@ Guidance for Claude Code when working in this repository.
 - In the `nix eval` calls, the host is selected with `builtins.getAttr` inside the `--apply` expression (see `hostApplyExpr`/`nixQuoteString`) instead of interpolating it into the CLI attrpath, so any attribute name works - the Nix CLI attrpath syntax cannot represent quotes or backslashes at all. Do NOT pre-quote the attribute for `nixos-rebuild --flake` either - nixos-rebuild quotes the flake attribute itself, and pre-quoting breaks it.
 - Three Nix expressions are configurable so the tool can adapt to flakes that don't follow the default convention:
   - `--list-hosts-expr` (default: `builtins.attrNames`)
-  - `--deployment-expr` (default reads `config.deployment.targetHost` falling back to `config.passthru.deployment.targetHost`)
+  - `--deployment-expr` (default reads `config.deployment.targetHost` falling back to `config.passthru.deployment.targetHost`, wrapped in `builtins.tryEval`: `or` only catches missing attributes, and accessing a declared-but-never-defined option like `passthru` throws, so hosts with no deployment info at all are cleanly excluded as "no target host configured")
   - `--closure-path-expr` (default: `config.system.build.toplevel.outPath`)
 - Closure paths are only evaluated for `apply` and `compare` (the `needsClosurePath` flag in `main`). `exec` skips that evaluation.
 - Host listing, deployment-info evaluation, and closure-path evaluation all run in parallel bounded by `-P` (default: 1).

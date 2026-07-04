@@ -33,8 +33,11 @@ var (
 	// Expression to list all hosts from nixosConfigurations
 	DefaultListHostsExpr = "builtins.attrNames"
 
-	// Expression to get deployment info for a specific host
-	DefaultDeploymentExpr = "cfg: { targetHost = cfg.config.deployment.targetHost or cfg.config.passthru.deployment.targetHost or null; }"
+	// Expression to get deployment info for a specific host.
+	// 'or' only catches missing attributes; accessing a declared-but-never-
+	// defined option (e.g. passthru) throws, so the chain is wrapped in
+	// tryEval to cleanly exclude hosts that define no deployment info at all.
+	DefaultDeploymentExpr = "cfg: { targetHost = let r = builtins.tryEval (cfg.config.deployment.targetHost or cfg.config.passthru.deployment.targetHost or null); in if r.success then r.value else null; }"
 
 	// Expression to get system path for a specific host
 	DefaultClosurePathExpr = "cfg: cfg.config.system.build.toplevel.outPath"

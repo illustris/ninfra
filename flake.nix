@@ -62,19 +62,16 @@
 			];
 		};
 
-		# A host with a dotted attribute name and no deployment.targetHost.
-		# ninfra excludes it from all operations; the VM test uses it to
-		# exercise Nix attrpath quoting and host-exclusion handling.
+		# A host with a dotted attribute name and no deployment info at all
+		# (neither deployment nor passthru.deployment is defined). ninfra
+		# excludes it from all operations; the VM test uses it to exercise
+		# host name quoting and clean host-exclusion handling.
 		nixosConfigurations."web02.example.com" = nixpkgs.lib.nixosSystem {
 			system = "x86_64-linux";
 			modules = [{
 				fileSystems."/" = { device = "/dev/vda1"; fsType = "ext4"; };
 				boot.loader.grub.device = "nodev";
 				system.stateVersion = "25.05";
-				# Defined but empty, so the default deployment expression
-				# falls through to null instead of erroring on the
-				# undefined passthru option
-				passthru = { };
 			}];
 		};
 
