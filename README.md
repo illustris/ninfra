@@ -21,9 +21,13 @@ By default ninfra reads `nixosConfigurations` from the flake in the current dire
 
 ### Subcommands
 
-- **exec**: Execute a command on the specified hosts. Arguments are shell-quoted so the remote argv matches what you typed locally; to use shell features (pipes, globs, variables), pass them through an explicit shell: `ninfra exec sh -c 'systemctl list-units | grep failed'`.
-- **apply**: Perform a NixOS rebuild action (`nixos-rebuild`) on the specified hosts. Each host builds in its own temporary working directory, so parallel applies cannot race on a shared `result` symlink and your flake checkout stays clean; for build-style actions the per-host `result` symlinks are kept and their locations printed. Because of this, relative paths in pass-through arguments or `NIX_SSHOPTS` must be absolute.
-- **compare**: Compare the deployed system paths with the configured paths from the flake. Exits non-zero if any host mismatches, cannot be reached (`Connection failed`), or fails the remote check (`Remote error`).
+- **exec**: Execute a command on the specified hosts. Arguments are shell-quoted so the remote argv matches what you typed locally; to use shell features (pipes, globs, variables), pass them through an explicit shell: `ninfra exec sh -c 'systemctl list-units | grep failed'`. If any host's command fails, ninfra prints a per-host summary (each host as `OK` or `failed (exit N)`) and exits non-zero.
+- **apply**: Perform a NixOS rebuild action (`nixos-rebuild`) on the specified hosts. With multiple hosts, apply runs in two phases: it first builds the configuration for every matching host and only runs the action on them once all builds succeed, so a build failure aborts the whole apply before any host is changed. With a single matching host the separate build phase is skipped automatically (a standalone pre-build is redundant when the rebuild builds the closure anyway). Each host builds in its own temporary working directory, so parallel applies cannot race on a shared `result` symlink and your flake checkout stays clean; for build-style actions the per-host `result` symlinks are kept and their locations printed. Because of this, relative paths in pass-through arguments or `NIX_SSHOPTS` must be absolute.
+- **compare**: Compare the deployed system paths with the configured paths from the flake. Prints a table with columns HOST, ACTIVE, BOOT, PERSISTED, STATUS: ACTIVE is `Y` when the running system (`/run/current-system`) equals the flake's evaluated closure, BOOT is `Y` when the boot default (`/nix/var/nix/profiles/system`) equals it, and PERSISTED is `Y` when the running system equals the boot default (i.e. the active configuration will survive a reboot). Exits non-zero if any host mismatches, cannot be reached (`Connection failed`), or fails the remote check (`Remote error`).
+
+### Output
+
+Progress messages, the resolved "Selected hosts" listing, per-host command output (streamed live and prefixed with the host name, with stderr lines tagged `host (stderr):`), and failure summaries all go to **stderr**. Only `compare` writes to **stdout**: its table (plus the `-v` report and a trailing summary line), or, with `-json`, just the JSON payload. This keeps `compare` output pipeable, but note that `exec` command output is on stderr, so redirecting stdout will not capture it.
 
 ### Options
 
@@ -45,24 +49,24 @@ All SSH connections run with `BatchMode=yes`, so authentication failures fail fa
 
 #### Apply Options
 
-- `--fast`: Skip the initial build phase.
+- `--fast`: Skip the separate build phase. This phase is redundant for a single matching host and is skipped there automatically, so `--fast` only changes behavior for multi-host applies.
 - `--use-substitutes`: Use substitutes when rebuilding (default: `true`).
 
 #### Compare Options
 
 - `-v`: Enable verbose output showing detailed comparison report.
-- `-json`: Output results as JSON on stdout (for CI/monitoring); exit-code semantics are unchanged and human messages stay off stdout. The match fields are only meaningful when `error` is unset.
+- `-json`: Output results as JSON on stdout (for CI/monitoring); exit-code semantics are unchanged and human messages stay off stdout. The output is an array of objects, each with `host` and `expected`, plus `currentSystem`/`systemProfile` (the deployed active/boot paths) on success. The booleans `activeMatch`, `bootMatch`, and `persisted` are always present but only meaningful when `error` is unset; on failure the object carries `error` and, for SSH/transport failures only, `connectionError: true`.
 
 #### Advanced Options
 
-- `--list-hosts-expr <expr>`: Nix expression to list hosts (applied to the flake's `nixosConfigurations`).
-- `--deployment-expr <expr>`: Nix expression to extract deployment info.
-- `--closure-path-expr <expr>`: Nix expression to extract system path.
+- `--list-hosts-expr <expr>`: Nix expression applied to the flake's `nixosConfigurations` to list host names (default: `builtins.attrNames`).
+- `--deployment-expr <expr>`: Nix expression (a function of a host's configuration) to extract deployment info (default: reads `config.deployment.targetHost`, falling back to `config.passthru.deployment.targetHost`, else null so the host is skipped).
+- `--closure-path-expr <expr>`: Nix expression (a function of a host's configuration) to extract the system closure path (default: `cfg: cfg.config.system.build.toplevel.outPath`).
 
 ### Arguments
 
 - **exec**: Provide the command to execute on the target hosts.
-- **apply**: Specify the rebuild action (`switch`, `boot`, etc.); any further arguments (e.g. `--install-bootloader`, `--show-trace`) are passed through to `nixos-rebuild` in both the build and apply phases. Passing extra arguments requires naming the action explicitly first: `ninfra apply switch --show-trace`.
+- **apply**: The rebuild action is optional and defaults to `switch`; name another action (`boot`, `test`, `dry-activate`, `build`, ...) as the first argument to override it. Any further arguments (e.g. `--install-bootloader`, `--show-trace`) are passed through to `nixos-rebuild` in both the build and apply phases. Passing extra arguments requires naming the action explicitly first: `ninfra apply switch --show-trace`.
 - **compare**: No additional arguments required.
 
 If every host matching the `--on` filter is excluded (for example because it has no `deployment.targetHost`), ninfra exits with an error instead of silently doing nothing.

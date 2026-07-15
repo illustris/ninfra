@@ -396,8 +396,9 @@ func newCmd(name string, args ...string) *CmdWithCancel {
 }
 
 // lineWriter is an io.Writer that logs each complete line with a prefix.
-// Unlike bufio.Scanner it has no maximum line length; a partial trailing
-// line is emitted by Flush.
+// Unlike bufio.Scanner it has no hard line-length cap that errors or drops;
+// long newline-free runs are flushed in chunks (see lineWriterFlushLimit)
+// and a partial trailing line is emitted by Flush.
 type lineWriter struct {
 	prefix string
 	buf    bytes.Buffer
