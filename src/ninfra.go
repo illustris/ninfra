@@ -7,20 +7,41 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
 
+type HealthCheck struct {
+	Type         string `json:"type"`
+	Port         int    `json:"port,omitempty"`
+	Host         string `json:"host,omitempty"`
+	URL          string `json:"url,omitempty"`
+	ExpectStatus int    `json:"expectStatus,omitempty"`
+	Command      string `json:"command,omitempty"`
+	Match        string `json:"match,omitempty"`
+}
+
 type DeploymentInfo struct {
-	TargetHost string `json:"targetHost"`
+	TargetHost           string                 `json:"targetHost"`
+	Group                string                 `json:"group"`
+	MaxConcurrentNodes   int                    `json:"maxConcurrentNodes"`
+	FailureDomain        string                 `json:"failureDomain"`
+	MaxConcurrentDomains int                    `json:"maxConcurrentDomains"`
+	HealthChecks         map[string]HealthCheck `json:"healthChecks"`
 }
 
 type HostConfig struct {
@@ -39,7 +60,9 @@ const (
 	// 'or' only catches missing attributes; accessing a declared-but-never-
 	// defined option (e.g. passthru) throws, so the chain is wrapped in
 	// tryEval to cleanly exclude hosts that define no deployment info at all.
-	DefaultDeploymentExpr = "cfg: { targetHost = let r = builtins.tryEval (cfg.config.deployment.targetHost or cfg.config.passthru.deployment.targetHost or null); in if r.success then r.value else null; }"
+	// Precedence is whole-set: when config.deployment exists it wins
+	// entirely - there is no per-field merge with passthru.deployment.
+	DefaultDeploymentExpr = "cfg: let r = builtins.tryEval (cfg.config.deployment or cfg.config.passthru.deployment or { }); d = if r.success then r.value else { }; in { targetHost = d.targetHost or null; group = d.group or null; maxConcurrentNodes = d.maxConcurrentNodes or null; failureDomain = d.failureDomain or null; maxConcurrentDomains = d.maxConcurrentDomains or null; healthChecks = d.healthChecks or { }; }"
 
 	// Expression to get system path for a specific host
 	DefaultClosurePathExpr = "cfg: cfg.config.system.build.toplevel.outPath"
@@ -61,6 +84,11 @@ type Options struct {
 	Username        string
 	Parallelism     int
 	Filter          string
+
+	HealthTimeout    time.Duration
+	SkipHealthChecks bool
+	CheckFilter      string
+	IgnoreCheckFilter string
 }
 
 var opts Options
@@ -339,6 +367,325 @@ func parseConfigurations(needsClosurePath bool) (Configurations, error) {
 
 	// Get configurations for matching hosts
 	return getHostsConfigs(re, needsClosurePath)
+}
+
+// namedCheck pairs a health check with its name from the deployment attrset.
+type namedCheck struct {
+	name  string
+	check HealthCheck
+}
+
+// sortedStringKeys returns the keys of m in sorted order.
+func sortedStringKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedIntKeys returns the keys of m in sorted order.
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// selectedChecks returns a host's checks filtered by --check (include, anchored
+// regex like --on) then --ignore-check (exclude), sorted by check name for
+// deterministic output and gate order.
+func selectedChecks(cfg HostConfig, include, ignore *regexp.Regexp) []namedCheck {
+	var out []namedCheck
+	for _, name := range sortedStringKeys(cfg.Deployment.HealthChecks) {
+		if include != nil && !include.MatchString(name) {
+			continue
+		}
+		if ignore != nil && ignore.MatchString(name) {
+			continue
+		}
+		out = append(out, namedCheck{name: name, check: cfg.Deployment.HealthChecks[name]})
+	}
+	return out
+}
+
+// validateDeployment rejects malformed health check definitions and
+// inconsistent rolling knobs before any operation runs, so a typo aborts the
+// run instead of surfacing mid-deploy.
+func validateDeployment(configs Configurations) error {
+	for _, host := range sortedHosts(configs) {
+		for _, name := range sortedStringKeys(configs[host].Deployment.HealthChecks) {
+			c := configs[host].Deployment.HealthChecks[name]
+			switch c.Type {
+			case "tcp":
+				if c.Port < 1 || c.Port > 65535 {
+					return fmt.Errorf("host %s: health check %s: invalid port %d (must be 1-65535)", host, name, c.Port)
+				}
+			case "http":
+				if c.URL == "" {
+					return fmt.Errorf("host %s: health check %s: url must not be empty", host, name)
+				}
+				u, err := url.Parse(c.URL)
+				if err != nil {
+					return fmt.Errorf("host %s: health check %s: invalid url %q: %v", host, name, c.URL, err)
+				}
+				if u.Scheme != "http" && u.Scheme != "https" {
+					return fmt.Errorf("host %s: health check %s: url scheme must be http or https, got %q", host, name, u.Scheme)
+				}
+			case "exec", "output":
+				if c.Command == "" {
+					return fmt.Errorf("host %s: health check %s: command must not be empty", host, name)
+				}
+				if c.Type == "output" {
+					if _, err := regexp.Compile(c.Match); err != nil {
+						return fmt.Errorf("host %s: health check %s: invalid match regex %q: %v", host, name, c.Match, err)
+					}
+				}
+			default:
+				return fmt.Errorf("host %s: health check %s: unknown type %q (must be tcp, http, exec, or output)", host, name, c.Type)
+			}
+		}
+	}
+
+	// Rolling knobs: unset (0) means "inherit the default" and never
+	// conflicts. k must agree within each group; j is a global scheduler knob
+	// delivered via per-host attrs (ninfra has no global config file), so all
+	// non-zero j values must agree across the selected hosts.
+	groupK := make(map[string]map[int][]string)
+	domainJ := make(map[int][]string)
+	for _, host := range sortedHosts(configs) {
+		d := configs[host].Deployment
+		if d.Group != "" && d.MaxConcurrentNodes != 0 {
+			if groupK[d.Group] == nil {
+				groupK[d.Group] = make(map[int][]string)
+			}
+			groupK[d.Group][d.MaxConcurrentNodes] = append(groupK[d.Group][d.MaxConcurrentNodes], host)
+		}
+		if d.MaxConcurrentDomains != 0 {
+			domainJ[d.MaxConcurrentDomains] = append(domainJ[d.MaxConcurrentDomains], host)
+		}
+	}
+	for _, group := range sortedStringKeys(groupK) {
+		if values := groupK[group]; len(values) > 1 {
+			return fmt.Errorf("conflicting maxConcurrentNodes within group %s: %s", group, describeKnobConflict(values))
+		}
+	}
+	if len(domainJ) > 1 {
+		return fmt.Errorf("conflicting maxConcurrentDomains across hosts: %s", describeKnobConflict(domainJ))
+	}
+	return nil
+}
+
+// describeKnobConflict renders a value -> hosts map as "2 (hosts: a, b); 3 (hosts: c)".
+func describeKnobConflict(values map[int][]string) string {
+	var parts []string
+	for _, v := range sortedIntKeys(values) {
+		parts = append(parts, fmt.Sprintf("%d (hosts: %s)", v, strings.Join(values[v], ", ")))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// effectiveMaxConcurrentNodes returns the group's k: the maxConcurrentNodes
+// value shared by the group's hosts, or 1 when unset (0).
+func effectiveMaxConcurrentNodes(configs Configurations, group string) int {
+	for _, host := range sortedHosts(configs) {
+		if configs[host].Deployment.Group == group {
+			if k := configs[host].Deployment.MaxConcurrentNodes; k > 0 {
+				return k
+			}
+		}
+	}
+	return 1
+}
+
+// effectiveMaxConcurrentDomains returns the global j: the maxConcurrentDomains
+// value set on any selected host, or 1 when unset (0).
+func effectiveMaxConcurrentDomains(configs Configurations) int {
+	for _, host := range sortedHosts(configs) {
+		if j := configs[host].Deployment.MaxConcurrentDomains; j > 0 {
+			return j
+		}
+	}
+	return 1
+}
+
+// describeCheck renders a check for tables/logs, e.g. "exporterPort (tcp:9100)",
+// "metrics (http:http://h/metrics)", "appActive (exec:systemctl is-active foo)".
+// The rendering is capped at 60 chars for table sanity.
+func describeCheck(name string, c HealthCheck) string {
+	var inner string
+	switch c.Type {
+	case "tcp":
+		inner = fmt.Sprintf("tcp:%d", c.Port)
+	case "http":
+		inner = "http:" + c.URL
+	case "exec":
+		inner = "exec:" + c.Command
+	case "output":
+		inner = "output:" + c.Command
+	default:
+		inner = c.Type
+	}
+	s := fmt.Sprintf("%s (%s)", name, inner)
+	if len(s) > 60 {
+		s = s[:57] + "..."
+	}
+	return s
+}
+
+// lastLine returns the final non-empty line of s.
+func lastLine(s string) string {
+	s = strings.TrimRight(s, "\r\n")
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
+}
+
+type checkResult struct {
+	host    string
+	name    string
+	check   HealthCheck
+	err     error  // nil = pass
+	detail  string // e.g. matched output line or failure detail
+	connErr bool   // ssh transport failure (exit 255), like compareResult.connErr
+}
+
+// runHealthCheck executes a single health check. tcp and http checks run on
+// the controller (probing what a real client sees, no remote tooling needed);
+// exec and output run on the target over SSH.
+func runHealthCheck(host string, cfg HostConfig, name string, c HealthCheck, username string) checkResult {
+	res := checkResult{host: host, name: name, check: c}
+	switch c.Type {
+	case "tcp":
+		dialHost := c.Host
+		if dialHost == "" {
+			dialHost = cfg.Deployment.TargetHost
+		}
+		conn, err := net.DialTimeout("tcp",
+			net.JoinHostPort(dialHost, strconv.Itoa(c.Port)),
+			time.Duration(opts.ConnectTimeout)*time.Second)
+		if err != nil {
+			res.err = err
+			res.detail = err.Error()
+			return res
+		}
+		conn.Close()
+		return res
+	case "http":
+		client := &http.Client{Timeout: time.Duration(opts.ConnectTimeout) * time.Second}
+		resp, err := client.Get(c.URL)
+		if err != nil {
+			res.err = err
+			res.detail = err.Error()
+			return res
+		}
+		// Drain a bounded amount so keepalive reuse is safe, without
+		// buffering an unbounded body.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		ok := resp.StatusCode >= 200 && resp.StatusCode <= 299
+		if c.ExpectStatus != 0 {
+			ok = resp.StatusCode == c.ExpectStatus
+		}
+		if !ok {
+			res.err = fmt.Errorf("unexpected status %d", resp.StatusCode)
+			res.detail = res.err.Error()
+		}
+		return res
+	case "exec", "output":
+		baseArgs, err := sshBaseArgs(username, cfg.Deployment.TargetHost, true, opts.TrustNewKeys)
+		if err != nil {
+			res.err = err
+			res.detail = err.Error()
+			return res
+		}
+		// The command is a single remote argv element after the '--'
+		// separator: the remote shell interprets it, so shell features
+		// (pipes, redirections, globs) are allowed.
+		args := append(baseArgs, c.Command)
+		cmdWithCancel := newCmd("ssh", args...)
+		defer cmdWithCancel.Cancel()
+		var stdout, stderr bytes.Buffer
+		cmdWithCancel.Stdout = &stdout
+		cmdWithCancel.Stderr = &stderr
+		err = cmdWithCancel.Run()
+		if errors.Is(err, exec.ErrWaitDelay) {
+			// Exited successfully but stdio was held open past WaitDelay.
+			err = nil
+		}
+		if err != nil {
+			// ssh exits 255 on connection/authentication failure.
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
+				res.connErr = true
+			}
+			res.err = err
+			res.detail = lastLine(stderr.String())
+			if res.detail == "" {
+				res.detail = err.Error()
+			}
+			return res
+		}
+		if c.Type == "output" {
+			re, err := regexp.Compile(c.Match)
+			if err != nil {
+				res.err = err
+				res.detail = err.Error()
+				return res
+			}
+			loc := re.FindIndex(stdout.Bytes())
+			if loc == nil {
+				res.err = fmt.Errorf("output %q does not match %q", stdout.String(), c.Match)
+				res.detail = res.err.Error()
+				return res
+			}
+			res.detail = stdout.String()[loc[0]:loc[1]]
+		}
+		return res
+	default:
+		res.err = fmt.Errorf("unknown check type %q", c.Type)
+		res.detail = res.err.Error()
+		return res
+	}
+}
+
+// healthPollInterval is how long waitHealthy sleeps between check rounds.
+const healthPollInterval = 2 * time.Second
+
+// waitHealthy polls all of a host's selected health checks until every one
+// passes or opts.HealthTimeout elapses; the error names the still-failing checks.
+func waitHealthy(host string, cfg HostConfig, checks []namedCheck, username string) error {
+	deadline := time.Now().Add(opts.HealthTimeout)
+	for {
+		var failing []namedCheck
+		details := make(map[string]string, len(checks))
+		for _, nc := range checks {
+			res := runHealthCheck(host, cfg, nc.name, nc.check, username)
+			if res.err != nil {
+				failing = append(failing, nc)
+				if res.connErr {
+					details[nc.name] = "connection failed: " + res.detail
+				} else {
+					details[nc.name] = res.detail
+				}
+			}
+		}
+		if len(failing) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			var parts []string
+			for _, nc := range failing {
+				parts = append(parts, fmt.Sprintf("%s: %s", describeCheck(nc.name, nc.check), details[nc.name]))
+			}
+			return fmt.Errorf("health checks for %s still failing after %s: %s", host, opts.HealthTimeout, strings.Join(parts, "; "))
+		}
+		time.Sleep(healthPollInterval)
+	}
 }
 
 // sshBaseArgs builds the base SSH arguments.
@@ -629,6 +976,88 @@ func nixosBuildAction(host, address string, args []string, username string) (*Cm
 	return newCmd("nixos-rebuild", cmdArgs...), nil
 }
 
+// hostBatch is one concurrently-applied set of hosts within a domain.
+type hostBatch struct {
+	domain string   // failureDomain value, "" = none
+	group  string   // group value, "" = ungrouped hosts
+	hosts  []string // sorted; applied concurrently (bounded by -P)
+}
+
+// planApplyWaves returns waves; a wave is a set of domains deployed
+// concurrently; a domain is an ordered list of batches. Degenerate input (no
+// host sets group or failureDomain) returns exactly one wave, one domain, one
+// batch with all hosts - preserving today's behavior through the same code
+// path.
+//
+// Batching: per domain, ungrouped hosts form ONE batch; each group's hosts are
+// chunked into batches of the group's effective k (its shared
+// maxConcurrentNodes, else 1). k is enforced per (domain, group) pair; with
+// the default j=1 that equals global k-of-n. Domains are deployed j at a time
+// (waves of maxConcurrentDomains consecutive domains, sorted names, "" sorts
+// first; hosts without a domain join the "" domain).
+func planApplyWaves(configs Configurations, maxConcurrentDomains int) [][][]hostBatch {
+	if maxConcurrentDomains < 1 {
+		maxConcurrentDomains = 1
+	}
+
+	// Group hosts by domain, then by group (ungrouped: "").
+	type domainPlan struct {
+		domain    string
+		batches   []hostBatch
+		ungrouped []string
+		groups    map[string][]string
+	}
+	domains := make(map[string]*domainPlan)
+	for _, host := range sortedHosts(configs) {
+		d := configs[host].Deployment
+		domain := d.FailureDomain
+		if domains[domain] == nil {
+			domains[domain] = &domainPlan{groups: make(map[string][]string)}
+		}
+		plan := domains[domain]
+		if d.Group == "" {
+			plan.ungrouped = append(plan.ungrouped, host)
+		} else {
+			plan.groups[d.Group] = append(plan.groups[d.Group], host)
+		}
+	}
+
+	// Sort everything; build batches per domain.
+	for name, plan := range domains {
+		plan.domain = name
+		sort.Strings(plan.ungrouped)
+		if len(plan.ungrouped) > 0 {
+			plan.batches = append(plan.batches, hostBatch{domain: name, group: "", hosts: plan.ungrouped})
+		}
+		for _, group := range sortedStringKeys(plan.groups) {
+			hosts := plan.groups[group]
+			sort.Strings(hosts)
+			k := effectiveMaxConcurrentNodes(configs, group)
+			for len(hosts) > 0 {
+				n := k
+				if n > len(hosts) {
+					n = len(hosts)
+				}
+				plan.batches = append(plan.batches, hostBatch{domain: name, group: group, hosts: hosts[:n]})
+				hosts = hosts[n:]
+			}
+		}
+	}
+
+	// Waves: chunks of j consecutive domains in sorted order ("" first).
+	names := sortedStringKeys(domains)
+	var waves [][][]hostBatch
+	wave := make([][]hostBatch, 0, maxConcurrentDomains)
+	for i, name := range names {
+		wave = append(wave, domains[name].batches)
+		if len(wave) == maxConcurrentDomains || i == len(names)-1 {
+			waves = append(waves, wave)
+			wave = make([][]hostBatch, 0, maxConcurrentDomains)
+		}
+	}
+	return waves
+}
+
 // applyWithBuild performs the build phase (unless skipped) and then the apply phase.
 // Extra arguments after the action are passed through to nixos-rebuild in
 // both phases.
@@ -638,7 +1067,7 @@ func nixosBuildAction(host, address string, args []string, username string) (*Cm
 // last-written host's build GC-rooted between the phases, and litter the
 // flake checkout. Relative paths in pass-through arguments or NIX_SSHOPTS
 // therefore need to be absolute.
-func applyWithBuild(configs Configurations, args []string, username string, parallelism int) error {
+func applyWithBuild(configs Configurations, args []string, username string, parallelism int, include, ignore *regexp.Regexp) error {
 	action := "switch"
 	if len(args) > 0 {
 		action = args[0]
@@ -691,7 +1120,8 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 	log.Println("Starting apply phase...")
 	finalArgs := append([]string{action}, extraArgs...)
 
-	if err := executeConcurrently(configs, finalArgs, username, parallelism, inWorkDir(nixosRebuildAction)); err != nil {
+	j := effectiveMaxConcurrentDomains(configs)
+	if err := applyRolling(configs, action, finalArgs, username, parallelism, workDirs, j, inWorkDir, include, ignore); err != nil {
 		return fmt.Errorf("apply phase failed: %w", err)
 	}
 	if keepWorkDirs {
@@ -699,6 +1129,186 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 		for _, host := range sortedHosts(configs) {
 			log.Printf("%s: %s", host, filepath.Join(workDirs[host], "result"))
 		}
+	}
+	return nil
+}
+
+// applyRolling runs the apply phase wave by wave, domain by domain, batch by
+// batch, health-gating switch/test batches. parallelism bounds all concurrent
+// remote ops. On any batch or gate failure, scheduling stops (in-flight hosts
+// finish) and the returned error lists applied vs skipped hosts. No rollback.
+func applyRolling(configs Configurations, action string, extraArgs []string, username string, parallelism int, workDirs map[string]string, maxConcurrentDomains int, inWorkDir func(ActionFunc) ActionFunc, include, ignore *regexp.Regexp) error {
+	waves := planApplyWaves(configs, maxConcurrentDomains)
+
+	totalDomains := 0
+	totalBatches := 0
+	for _, w := range waves {
+		totalDomains += len(w)
+		for _, d := range w {
+			totalBatches += len(d)
+		}
+	}
+	log.Printf("Apply plan: %d wave(s), %d domain(s), %d batch(es)", len(waves), totalDomains, totalBatches)
+
+	gateActive := (action == "switch" || action == "test") && !opts.SkipHealthChecks
+	if action != "switch" && action != "test" && !opts.SkipHealthChecks {
+		log.Printf("Action %q does not activate a configuration; the health check gate does not apply", action)
+	}
+
+	var (
+		sem       = make(chan struct{}, parallelism)
+		aborted   atomic.Bool
+		causeMu   sync.Mutex
+		cause     error
+		appliedMu sync.Mutex
+		applied   []string
+	)
+	recordFailure := func(err error) {
+		causeMu.Lock()
+		if cause == nil {
+			cause = err
+		}
+		causeMu.Unlock()
+		aborted.Store(true)
+	}
+
+	// applyBatch fans a batch's hosts out under the shared semaphore and
+	// returns the first per-host error, if any.
+	applyBatch := func(batch hostBatch) error {
+		var batchWG sync.WaitGroup
+		var errsMu sync.Mutex
+		errs := make(map[string]error, len(batch.hosts))
+		for _, host := range batch.hosts {
+			cfg := configs[host]
+			batchWG.Add(1)
+			sem <- struct{}{}
+			go func(host string, cfg HostConfig) {
+				defer batchWG.Done()
+				defer func() { <-sem }()
+				cmd, err := inWorkDir(nixosRebuildAction)(host, cfg.Deployment.TargetHost, extraArgs, username)
+				if err != nil {
+					errsMu.Lock()
+					errs[host] = fmt.Errorf("failed to create command: %w", err)
+					errsMu.Unlock()
+					return
+				}
+				if cmd == nil {
+					return
+				}
+				if err := executeAndStreamOutput(host, cmd); err != nil {
+					errsMu.Lock()
+					errs[host] = err
+					errsMu.Unlock()
+					return
+				}
+				appliedMu.Lock()
+				applied = append(applied, host)
+				appliedMu.Unlock()
+			}(host, cfg)
+		}
+		batchWG.Wait()
+		for _, host := range batch.hosts {
+			if err := errs[host]; err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// gateBatch waits for every batch host with selected health checks;
+	// returns the first failure, if any.
+	gateBatch := func(batch hostBatch) error {
+		type gatedHost struct {
+			host   string
+			cfg    HostConfig
+			checks []namedCheck
+		}
+		var gated []gatedHost
+		for _, host := range batch.hosts {
+			checks := selectedChecks(configs[host], include, ignore)
+			if len(checks) > 0 {
+				gated = append(gated, gatedHost{host: host, cfg: configs[host], checks: checks})
+			}
+		}
+		if len(gated) == 0 {
+			return nil
+		}
+		names := make([]string, len(gated))
+		for i, g := range gated {
+			names[i] = g.host
+		}
+		log.Printf("Waiting for health checks on %s...", strings.Join(names, " "))
+		var gateWG sync.WaitGroup
+		var errsMu sync.Mutex
+		errs := make(map[string]error, len(gated))
+		for _, g := range gated {
+			gateWG.Add(1)
+			sem <- struct{}{}
+			go func(host string, cfg HostConfig, checks []namedCheck) {
+				defer gateWG.Done()
+				defer func() { <-sem }()
+				if err := waitHealthy(host, cfg, checks, username); err != nil {
+					errsMu.Lock()
+					errs[host] = err
+					errsMu.Unlock()
+				}
+			}(g.host, g.cfg, g.checks)
+		}
+		gateWG.Wait()
+		for _, host := range names {
+			if err := errs[host]; err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, wave := range waves {
+		if aborted.Load() {
+			break
+		}
+		var waveWG sync.WaitGroup
+		for _, batches := range wave {
+			if aborted.Load() {
+				break
+			}
+			waveWG.Add(1)
+			go func(batches []hostBatch) {
+				defer waveWG.Done()
+				for _, batch := range batches {
+					if aborted.Load() {
+						return
+					}
+					if err := applyBatch(batch); err != nil {
+						recordFailure(fmt.Errorf("batch in domain %q failed: %w", batch.domain, err))
+						return
+					}
+					if gateActive {
+						if err := gateBatch(batch); err != nil {
+							recordFailure(fmt.Errorf("health checks failed in domain %q: %w", batch.domain, err))
+							return
+						}
+					}
+				}
+			}(batches)
+		}
+		waveWG.Wait()
+	}
+
+	if cause != nil {
+		sort.Strings(applied)
+		appliedSet := make(map[string]bool, len(applied))
+		for _, h := range applied {
+			appliedSet[h] = true
+		}
+		var skipped []string
+		for _, h := range sortedHosts(configs) {
+			if !appliedSet[h] {
+				skipped = append(skipped, h)
+			}
+		}
+		return fmt.Errorf("rolling apply aborted: %v; applied: [%s], skipped: [%s]",
+			cause, strings.Join(applied, " "), strings.Join(skipped, " "))
 	}
 	return nil
 }
@@ -806,6 +1416,101 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 	return results
 }
 
+// hostHealthResult collects one host's health check results; results is
+// empty when the host defines no checks (or none match the filters).
+type hostHealthResult struct {
+	host    string
+	results []checkResult
+}
+
+// getHealthResults runs the selected health checks on all hosts in parallel
+// (per host), checks within a host sequentially in selectedChecks order.
+func getHealthResults(configs Configurations, username string, parallelism int, include, ignore *regexp.Regexp) []hostHealthResult {
+	var wg sync.WaitGroup
+	resultsChan := make(chan hostHealthResult, len(configs))
+	sem := make(chan struct{}, parallelism)
+
+	for _, host := range sortedHosts(configs) {
+		cfg := configs[host]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(host string, cfg HostConfig) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			res := hostHealthResult{host: host}
+			for _, nc := range selectedChecks(cfg, include, ignore) {
+				res.results = append(res.results, runHealthCheck(host, cfg, nc.name, nc.check, username))
+			}
+			resultsChan <- res
+		}(host, cfg)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	var results []hostHealthResult
+	for r := range resultsChan {
+		results = append(results, r)
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].host < results[j].host })
+	return results
+}
+
+// healthJSONRow is the machine-readable form of one check result (or a
+// host's "no checks" row).
+type healthJSONRow struct {
+	Host   string `json:"host"`
+	Check  string `json:"check,omitempty"`
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// noChecksDetail renders the DETAIL for a host with zero selected checks:
+// hosts that define no checks at all are reported distinctly from hosts
+// whose checks were all filtered out. Neither counts as a failure.
+func noChecksDetail(cfg HostConfig, include, ignore *regexp.Regexp) string {
+	if len(cfg.Deployment.HealthChecks) == 0 {
+		return "no health checks defined"
+	}
+	return "no health checks matched"
+}
+
+// printHealthJSON writes the health results to stdout as JSON.
+// Returns (failures, connErrors) like printHealthTable.
+func printHealthJSON(results []hostHealthResult, configs Configurations, include, ignore *regexp.Regexp) (int, int) {
+	failures := 0
+	connErrors := 0
+	out := make([]healthJSONRow, 0)
+	for _, res := range results {
+		if len(res.results) == 0 {
+			out = append(out, healthJSONRow{Host: res.host, OK: true, Detail: noChecksDetail(configs[res.host], include, ignore)})
+			continue
+		}
+		for _, cr := range res.results {
+			row := healthJSONRow{
+				Host:  res.host,
+				Check: describeCheck(cr.name, cr.check),
+				OK:    cr.err == nil,
+			}
+			if cr.err != nil {
+				row.Error = cr.err.Error()
+				row.Detail = cr.detail
+				failures++
+				if cr.connErr {
+					connErrors++
+				}
+			}
+			out = append(out, row)
+		}
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+		log.Printf("Error encoding JSON output: %v", err)
+	}
+	return failures, connErrors
+}
+
 // compareJSON is the machine-readable form of a compareResult.
 type compareJSON struct {
 	Host            string `json:"host"`
@@ -881,6 +1586,37 @@ func printCompareVerbose(results []compareResult) {
 	}
 }
 
+// printHealthTable outputs a summary table of the health check results.
+// Returns (failures, connErrors).
+func printHealthTable(results []hostHealthResult, configs Configurations, include, ignore *regexp.Regexp) (int, int) {
+	failures := 0
+	connErrors := 0
+	fmt.Printf("%-20s %-40s %-8s %s\n", "HOST", "CHECK", "STATUS", "DETAIL")
+	for _, res := range results {
+		if len(res.results) == 0 {
+			fmt.Printf("%-20s %-40s %-8s %s\n", res.host, "-", "OK", noChecksDetail(configs[res.host], include, ignore))
+			continue
+		}
+		for _, cr := range res.results {
+			status := "OK"
+			detail := cr.detail
+			if cr.err != nil {
+				failures++
+				status = "FAIL"
+				if cr.connErr {
+					status = "Connection failed"
+					connErrors++
+				}
+				if detail == "" {
+					detail = cr.err.Error()
+				}
+			}
+			fmt.Printf("%-20s %-40s %-8s %s\n", res.host, describeCheck(cr.name, cr.check), status, detail)
+		}
+	}
+	return failures, connErrors
+}
+
 // printCompareTable outputs a summary table of the comparison.
 // Returns (mismatches, connErrors, remoteErrors)
 func printCompareTable(results []compareResult) (int, int, int) {
@@ -943,11 +1679,16 @@ func main() {
 		Username:        os.Getenv("USER"),
 		Parallelism:     1,
 		Filter:          ".*",
+
+		HealthTimeout:     2 * time.Minute,
+		SkipHealthChecks:  false,
+		CheckFilter:       ".*",
+		IgnoreCheckFilter: "",
 	}
 
 	// Define flags.
 	flag.StringVar(&opts.FlakeRef, "flake", opts.FlakeRef, "Flake to read nixosConfigurations from (path or flake reference)")
-	flag.BoolVar(&opts.JSONOutput, "json", opts.JSONOutput, "Output compare results as JSON")
+	flag.BoolVar(&opts.JSONOutput, "json", opts.JSONOutput, "Output compare/health results as JSON")
 	flag.StringVar(&opts.Filter, "on", opts.Filter, "Regex to select hosts by name (anchored: must match the whole name)")
 	flag.StringVar(&opts.Username, "l", opts.Username, "Specify the username for the target host")
 	flag.IntVar(&opts.Parallelism, "P", opts.Parallelism, "Specify the number of parallel jobs")
@@ -960,6 +1701,10 @@ func main() {
 	flag.BoolVar(&opts.UseSubstitutes, "use-substitutes", opts.UseSubstitutes, "Automatically use substitutes when rebuilding")
 	flag.BoolVar(&opts.Verbose, "v", opts.Verbose, "Enable verbose output for compare subcommand")
 	flag.DurationVar(&opts.Timeout, "timeout", opts.Timeout, "Timeout for remote commands (e.g. 5m, 1m)")
+	flag.DurationVar(&opts.HealthTimeout, "health-timeout", opts.HealthTimeout, "How long apply waits for a host's health checks to pass after a switch")
+	flag.BoolVar(&opts.SkipHealthChecks, "skip-health-checks", opts.SkipHealthChecks, "Do not wait for health checks between rolling apply batches")
+	flag.StringVar(&opts.CheckFilter, "check", opts.CheckFilter, "Regex to select health checks by name (anchored: must match the whole name)")
+	flag.StringVar(&opts.IgnoreCheckFilter, "ignore-check", opts.IgnoreCheckFilter, "Regex to exclude health checks by name (applied after --check)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: %s [options] <subcommand> [options] [arguments]
@@ -968,6 +1713,7 @@ Subcommands:
   exec               Execute a command on the specified hosts
   apply              Perform nixos-rebuild on the specified hosts
   compare            Compare resolved system paths with the configured path
+  health             Run the deployment health checks on the specified hosts
 
 Options may be given before or after the subcommand. Option parsing stops at
 the first non-option argument, so for exec, options must come before the
@@ -981,7 +1727,8 @@ Arguments:
   For exec:    Any command to execute on the target hosts
   For apply:   An optional action (default: switch). Extra arguments after
                an explicitly named action are passed through to nixos-rebuild
-  For compare: No additional arguments required`)
+  For compare: No additional arguments required
+  For health:  No additional arguments required`)
 	}
 
 	flag.Parse()
@@ -1003,7 +1750,7 @@ Arguments:
 
 	// Validate cheap things before any nix evaluation.
 	switch subcommand {
-	case "exec", "apply", "compare":
+	case "exec", "apply", "compare", "health":
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown subcommand '%s'.\n", subcommand)
 		flag.Usage()
@@ -1017,6 +1764,24 @@ Arguments:
 	}
 	if opts.Parallelism <= 0 {
 		log.Fatalf("Parallelism must be greater than 0, got: %d", opts.Parallelism)
+	}
+
+	// Compile the health check selection filters once; both the health
+	// subcommand and the apply gate use them. Anchored like --on.
+	var includeChecks, ignoreChecks *regexp.Regexp
+	if subcommand == "health" || subcommand == "apply" {
+		re, err := regexp.Compile("^(?:" + opts.CheckFilter + ")$")
+		if err != nil {
+			log.Fatalf("Error compiling --check regex: %v", err)
+		}
+		includeChecks = re
+		if opts.IgnoreCheckFilter != "" {
+			re, err := regexp.Compile("^(?:" + opts.IgnoreCheckFilter + ")$")
+			if err != nil {
+				log.Fatalf("Error compiling --ignore-check regex: %v", err)
+			}
+			ignoreChecks = re
+		}
 	}
 
 	// Resolve a plain local path to an absolute one so nixos-rebuild still
@@ -1063,6 +1828,9 @@ Arguments:
 	if err != nil {
 		log.Fatalf("Error parsing configurations: %v", err)
 	}
+	if err := validateDeployment(configs); err != nil {
+		log.Fatal(err)
+	}
 	if len(configs) == 0 {
 		log.Fatalf("Error: no deployable hosts: all hosts matching --on %q were excluded (see messages above)", opts.Filter)
 	}
@@ -1070,6 +1838,24 @@ Arguments:
 	printSelectedHosts(configs)
 
 	switch subcommand {
+	case "health":
+		results := getHealthResults(configs, opts.Username, opts.Parallelism, includeChecks, ignoreChecks)
+
+		var failures, connErrors int
+		if opts.JSONOutput {
+			failures, connErrors = printHealthJSON(results, configs, includeChecks, ignoreChecks)
+		} else {
+			failures, connErrors = printHealthTable(results, configs, includeChecks, ignoreChecks)
+		}
+
+		if failures > 0 || connErrors > 0 {
+			// Keep stdout pure JSON in -json mode; the exit code and the
+			// per-check error fields carry the same information
+			if !opts.JSONOutput {
+				fmt.Printf("\nFound %d host(s) with failing health checks, %d host(s) with connection errors.\n", failures, connErrors)
+			}
+			os.Exit(1)
+		}
 	case "exec":
 		if err := executeConcurrently(configs, args, opts.Username, opts.Parallelism, sshAction); err != nil {
 			log.Fatal(err)
@@ -1079,7 +1865,7 @@ Arguments:
 			log.Println("Single target node, implicitly skipping separate build phase.")
 			opts.SkipBuild = true
 		}
-		if err := applyWithBuild(configs, args, opts.Username, opts.Parallelism); err != nil {
+		if err := applyWithBuild(configs, args, opts.Username, opts.Parallelism, includeChecks, ignoreChecks); err != nil {
 			log.Fatal(err)
 		}
 	case "compare":

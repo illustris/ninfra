@@ -27,6 +27,21 @@
 			};
 			modified = {
 				imports = [ base ];
+				# passthru merges shallowly (last-wins per top-level key), so
+				# this must repeat the COMPLETE deployment set: adding only
+				# healthChecks would clobber base's targetHost.
+				passthru.deployment = {
+					targetHost = "target";
+					group = "web";
+					maxConcurrentNodes = 1;
+					failureDomain = "dc1";
+					healthChecks = {
+						exporterPort = { type = "tcp"; port = 9100; };
+						exporterMetrics = { type = "http"; url = "http://target:9100/metrics"; };
+						exporterActive = { type = "exec"; command = "systemctl is-active prometheus-node-exporter"; };
+						exporterReady = { type = "output"; command = "systemctl is-active prometheus-node-exporter"; match = "^active"; };
+					};
+				};
 				services.prometheus.exporters.node = {
 					enable = true;
 					openFirewall = true;
@@ -44,6 +59,12 @@
 						(modulesPath + "/testing/test-instrumentation.nix")
 						module
 					];
+					# Disable the /etc/nix/registry.json pin of nixpkgs: it
+					# would drag the 190MB nixpkgs source into every deployed
+					# closure, and the slirp nix copy of it can outrun the
+					# test's apply timeout, leaving the switch unapplied.
+					nixpkgs.flake.setFlakeRegistry = false;
+					nixpkgs.flake.setNixPath = false;
 					# Preserve test network configuration after switch. The
 					# addresses assume the test driver's alphabetical node
 					# numbering on vlan 1 (controller=1, target=2).
@@ -55,6 +76,15 @@
 						address = "2001:db8:1::2";
 						prefixLength = 64;
 					}];
+					# Preload the store with the exact closures ninfra deploys.
+					# The VM has no outside DNS, so a cold nix copy of these
+					# over slirp can outrun the test's apply timeout and leave
+					# the switch unapplied; with the store seeded, the copy is
+					# a no-op and only the switch itself runs. Each host is
+					# seeded with its own generation's toplevel (target-v2's
+					# node exporter also needs the exporter closure, pulled in
+					# via its toplevel).
+					virtualisation.additionalPaths = [ module.config.system.build.toplevel ];
 				})
 			];
 		};
@@ -90,6 +120,8 @@
 					src = ./src;
 					vendorHash = null;
 					env.CGO_ENABLED = 0;
+					# Runs `go test ./...` (planner/validation unit tests).
+					doCheck = true;
 				}
 			) {};
 			default = ninfra;
@@ -210,7 +242,9 @@
 					# cwd is read-only: all nixos-rebuild work happens in per-host temp
 					# directories. A preexisting NIX_SSHOPTS must not break the apply
 					# (this does not prove append-vs-clobber, only well-formedness).
-					(status, output) = controller.execute(f"cd {flake} && NIX_SSHOPTS='-o ConnectTimeout=30' timeout 300 ninfra apply --on target -l root 2>&1")
+					# 600s: the full base closure copy over slirp + DNS stalls can
+					# exceed 300s, and a killed copy leaves the switch unapplied.
+					(status, output) = controller.execute(f"cd {flake} && NIX_SSHOPTS='-o ConnectTimeout=30' timeout 600 ninfra apply --on target -l root 2>&1")
 					print(f"Apply exit status: {status}")
 					print(output)
 					assert status in (0, 124), f"Apply failed with status {status}: {output}"
@@ -226,12 +260,31 @@
 					assert re.search(r'target\s+Y\s+Y\s+Y', output), f"Expected match after apply, got: {output}"
 					assert "==== Compare Report ====" in output, f"Expected verbose report from post-subcommand -v, got: {output}"
 
+					# Health checks are defined only on target-v2 (node exporter); before the v2
+					# apply they must fail (port closed, unit missing)
+					(status, output) = controller.execute(f"cd {flake} && ninfra health --on target-v2 -l root 2>&1")
+					print(output)
+					assert status == 1, f"Expected failing health checks before v2 apply, got {status}: {output}"
+					assert "exporterPort" in output, f"Expected named tcp check row, got: {output}"
+
+					# --check selects a single named check (still failing here)
+					(status, output) = controller.execute(f"cd {flake} && ninfra health --on target-v2 -l root --check exporterPort 2>&1")
+					print(output)
+					assert status == 1 and "exporterPort" in output and "exporterMetrics" not in output, f"Expected only exporterPort, got: {output}"
+
+					# --ignore-check subtracting everything is not an error
+					controller.succeed(f"cd {flake} && ninfra health --on target-v2 -l root --ignore-check 'exporter.*' 2>&1")
+
+					# A host with no health checks defined is not an error
+					controller.succeed(f"cd {flake} && ninfra health --on target -l root 2>&1")
+
 					# Deploy the second generation (target-v2: same VM, adds the node
 					# exporter) to exercise a real configuration switch
-					(status, output) = controller.execute(f"cd {flake} && timeout 300 ninfra apply --on target-v2 -l root 2>&1")
+					(status, output) = controller.execute(f"cd {flake} && timeout 600 ninfra apply --on target-v2 -l root --health-timeout 3m 2>&1")
 					print(f"Second apply exit status: {status}")
 					print(output)
 					assert status in (0, 124), f"Second apply failed with status {status}: {output}"
+					assert "Waiting for health checks" in output, f"Expected health gate in rolling apply: {output}"
 
 					target.wait_for_unit("sshd.service")
 					target.wait_for_unit("network-addresses-eth1.service")
@@ -243,6 +296,14 @@
 					results = json.loads(out)
 					assert len(results) == 1 and results[0]["host"] == "target-v2", f"Unexpected JSON results: {out}"
 					assert results[0]["activeMatch"] and results[0]["bootMatch"] and results[0]["persisted"], f"Expected full match for target-v2: {out}"
+
+					# All four named health checks must pass after the v2 apply
+					# (machine-readable)
+					out = controller.succeed(f"cd {flake} && ninfra health --on target-v2 -l root -json 2>/dev/null")
+					print(out)
+					rows = json.loads(out)
+					assert len(rows) == 4 and all(r["ok"] for r in rows), f"Expected all health checks to pass: {out}"
+					assert sorted(r["check"].split(" ")[0] for r in rows) == ["exporterActive", "exporterMetrics", "exporterPort", "exporterReady"], f"Expected named checks in JSON: {out}"
 
 					# ...and drifts from the original target config, which compare
 					# must report as a mismatch (active/boot changed, persisted)
