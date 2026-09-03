@@ -1058,6 +1058,13 @@ func planApplyWaves(configs Configurations, maxConcurrentDomains int) [][][]host
 	return waves
 }
 
+// applyRolling runs the apply phase through the rolling scheduler. gate is
+// on for activating actions; extraArgs are the action + pass-through args.
+func applyRolling(configs Configurations, action string, extraArgs []string, username string, parallelism int, maxConcurrentDomains int, inWorkDir func(ActionFunc) ActionFunc, include, ignore *regexp.Regexp) error {
+	gate := action == "switch" || action == "test"
+	return rollingRun(configs, inWorkDir(nixosRebuildAction), extraArgs, "Apply", username, parallelism, maxConcurrentDomains, include, ignore, gate)
+}
+
 // applyWithBuild performs the build phase (unless skipped) and then the apply phase.
 // Extra arguments after the action are passed through to nixos-rebuild in
 // both phases.
@@ -1121,7 +1128,7 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 	finalArgs := append([]string{action}, extraArgs...)
 
 	j := effectiveMaxConcurrentDomains(configs)
-	if err := applyRolling(configs, action, finalArgs, username, parallelism, workDirs, j, inWorkDir, include, ignore); err != nil {
+	if err := applyRolling(configs, action, finalArgs, username, parallelism, j, inWorkDir, include, ignore); err != nil {
 		return fmt.Errorf("apply phase failed: %w", err)
 	}
 	if keepWorkDirs {
@@ -1133,11 +1140,13 @@ func applyWithBuild(configs Configurations, args []string, username string, para
 	return nil
 }
 
-// applyRolling runs the apply phase wave by wave, domain by domain, batch by
-// batch, health-gating switch/test batches. parallelism bounds all concurrent
-// remote ops. On any batch or gate failure, scheduling stops (in-flight hosts
-// finish) and the returned error lists applied vs skipped hosts. No rollback.
-func applyRolling(configs Configurations, action string, extraArgs []string, username string, parallelism int, workDirs map[string]string, maxConcurrentDomains int, inWorkDir func(ActionFunc) ActionFunc, include, ignore *regexp.Regexp) error {
+// rollingRun executes actionFn on the selected hosts through the rolling
+// plan: wave by wave, domain by domain, batch by batch, health-gating
+// completed batches. parallelism bounds all concurrent remote ops. On any
+// batch or gate failure, scheduling stops (in-flight hosts finish) and the
+// returned error lists completed vs skipped hosts. No rollback. label names
+// the operation in log/plan lines (e.g. "Apply"); it is not a ninfra flag.
+func rollingRun(configs Configurations, actionFn ActionFunc, extraArgs []string, label string, username string, parallelism int, maxConcurrentDomains int, include, ignore *regexp.Regexp, gate bool) error {
 	waves := planApplyWaves(configs, maxConcurrentDomains)
 
 	totalDomains := 0
@@ -1148,11 +1157,11 @@ func applyRolling(configs Configurations, action string, extraArgs []string, use
 			totalBatches += len(d)
 		}
 	}
-	log.Printf("Apply plan: %d wave(s), %d domain(s), %d batch(es)", len(waves), totalDomains, totalBatches)
+	log.Printf("%s plan: %d wave(s), %d domain(s), %d batch(es)", label, len(waves), totalDomains, totalBatches)
 
-	gateActive := (action == "switch" || action == "test") && !opts.SkipHealthChecks
-	if action != "switch" && action != "test" && !opts.SkipHealthChecks {
-		log.Printf("Action %q does not activate a configuration; the health check gate does not apply", action)
+	if gate && opts.SkipHealthChecks {
+		gate = false
+		log.Printf("%s runs with the health check gate disabled (--skip-health-checks)", label)
 	}
 
 	var (
@@ -1160,8 +1169,8 @@ func applyRolling(configs Configurations, action string, extraArgs []string, use
 		aborted   atomic.Bool
 		causeMu   sync.Mutex
 		cause     error
-		appliedMu sync.Mutex
-		applied   []string
+		completedMu sync.Mutex
+		completed   []string
 	)
 	recordFailure := func(err error) {
 		causeMu.Lock()
@@ -1185,7 +1194,7 @@ func applyRolling(configs Configurations, action string, extraArgs []string, use
 			go func(host string, cfg HostConfig) {
 				defer batchWG.Done()
 				defer func() { <-sem }()
-				cmd, err := inWorkDir(nixosRebuildAction)(host, cfg.Deployment.TargetHost, extraArgs, username)
+				cmd, err := actionFn(host, cfg.Deployment.TargetHost, extraArgs, username)
 				if err != nil {
 					errsMu.Lock()
 					errs[host] = fmt.Errorf("failed to create command: %w", err)
@@ -1201,9 +1210,9 @@ func applyRolling(configs Configurations, action string, extraArgs []string, use
 					errsMu.Unlock()
 					return
 				}
-				appliedMu.Lock()
-				applied = append(applied, host)
-				appliedMu.Unlock()
+				completedMu.Lock()
+				completed = append(completed, host)
+				completedMu.Unlock()
 			}(host, cfg)
 		}
 		batchWG.Wait()
@@ -1283,7 +1292,7 @@ func applyRolling(configs Configurations, action string, extraArgs []string, use
 						recordFailure(fmt.Errorf("batch in domain %q failed: %w", batch.domain, err))
 						return
 					}
-					if gateActive {
+					if gate {
 						if err := gateBatch(batch); err != nil {
 							recordFailure(fmt.Errorf("health checks failed in domain %q: %w", batch.domain, err))
 							return
@@ -1296,19 +1305,19 @@ func applyRolling(configs Configurations, action string, extraArgs []string, use
 	}
 
 	if cause != nil {
-		sort.Strings(applied)
-		appliedSet := make(map[string]bool, len(applied))
-		for _, h := range applied {
-			appliedSet[h] = true
+		sort.Strings(completed)
+		completedSet := make(map[string]bool, len(completed))
+		for _, h := range completed {
+			completedSet[h] = true
 		}
 		var skipped []string
 		for _, h := range sortedHosts(configs) {
-			if !appliedSet[h] {
+			if !completedSet[h] {
 				skipped = append(skipped, h)
 			}
 		}
-		return fmt.Errorf("rolling apply aborted: %v; applied: [%s], skipped: [%s]",
-			cause, strings.Join(applied, " "), strings.Join(skipped, " "))
+		return fmt.Errorf("rolling %s aborted: %v; done: [%s], skipped: [%s]",
+			strings.ToLower(label), cause, strings.Join(completed, " "), strings.Join(skipped, " "))
 	}
 	return nil
 }
@@ -1838,6 +1847,15 @@ Arguments:
 	printSelectedHosts(configs)
 
 	switch subcommand {
+	case "exec":
+		// exec rolls like apply: group/domain batches with the health
+		// gate between batches. Degenerate deployment attrs (no group or
+		// domain anywhere) yield one batch, i.e. today's all-at-once
+		// behavior; the gate only waits on hosts that define checks.
+		j := effectiveMaxConcurrentDomains(configs)
+		if err := rollingRun(configs, sshAction, args, "Exec", opts.Username, opts.Parallelism, j, includeChecks, ignoreChecks, true); err != nil {
+			log.Fatal(err)
+		}
 	case "health":
 		results := getHealthResults(configs, opts.Username, opts.Parallelism, includeChecks, ignoreChecks)
 
@@ -1855,10 +1873,6 @@ Arguments:
 				fmt.Printf("\nFound %d host(s) with failing health checks, %d host(s) with connection errors.\n", failures, connErrors)
 			}
 			os.Exit(1)
-		}
-	case "exec":
-		if err := executeConcurrently(configs, args, opts.Username, opts.Parallelism, sshAction); err != nil {
-			log.Fatal(err)
 		}
 	case "apply":
 		if len(configs) == 1 && !opts.SkipBuild {
