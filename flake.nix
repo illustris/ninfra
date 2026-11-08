@@ -16,6 +16,7 @@
 		# neither has to reach into the other's internals
 		targetModules = rec {
 			base = {
+				networking.hostName = "target";
 				passthru.deployment.targetHost = "target";
 				services.openssh.enable = true;
 				virtualisation.diskSize = 4096;
@@ -76,15 +77,6 @@
 						address = "2001:db8:1::2";
 						prefixLength = 64;
 					}];
-					# Preload the store with the exact closures ninfra deploys.
-					# The VM has no outside DNS, so a cold nix copy of these
-					# over slirp can outrun the test's apply timeout and leave
-					# the switch unapplied; with the store seeded, the copy is
-					# a no-op and only the switch itself runs. Each host is
-					# seeded with its own generation's toplevel (target-v2's
-					# node exporter also needs the exporter closure, pulled in
-					# via its toplevel).
-					virtualisation.additionalPaths = [ module.config.system.build.toplevel ];
 				})
 			];
 		};
@@ -135,8 +127,8 @@
 
 			# A host with a dotted attribute name and no deployment info at all
 			# (neither deployment nor passthru.deployment is defined). ninfra
-			# excludes it from all operations; the VM test uses it to exercise
-			# host name quoting and clean host-exclusion handling.
+			# excludes it remotely; local mode can select it without deployment
+			# metadata. The VM test exercises both paths and dotted host names.
 			"web02.example.com" = nixpkgs.lib.nixosSystem {
 				system = "x86_64-linux";
 				modules = [{
@@ -181,12 +173,37 @@
 						];
 					};
 
-					target = targetModules.base;
+					target = {
+						imports = [ targetModules.base ];
+						virtualisation = {
+							# Seed evaluated generations and locked sources for offline local rebuilds.
+							additionalPaths = [
+								self
+								nixpkgs
+								self.packages.x86_64-linux.ninfra
+								self.nixosConfigurations.target.config.system.build.toplevel
+								self.nixosConfigurations.target-v2.config.system.build.toplevel
+							];
+							memorySize = 4096;
+							cores = 4;
+						};
+					};
 				};
 
 				testScript = self.lib.indent ''
 					import json
 					import re
+					import shlex
+
+					def local_cmd(*args, path="/tmp/no-ssh:/run/current-system/sw/bin"):
+					    words = [
+					        "env", "-u", "USER",
+					        "NIX_CONFIG=experimental-features = nix-command flakes\nflake-registry = ",
+					        "PATH=" + path,
+					        "${self.packages.x86_64-linux.ninfra}/bin/ninfra",
+					        "--flake", "${self}", *args,
+					    ]
+					    return " ".join(shlex.quote(word) for word in words)
 
 					controller.wait_for_unit("multi-user.target")
 					target.wait_for_unit("sshd.service")
@@ -311,6 +328,156 @@
 					print(output)
 					assert status == 1, f"Expected exit code 1 for drift, got: {status}"
 					assert re.search(r'target\s+N\s+N\s+Y', output), f"Expected drift after second apply, got: {output}"
+
+					# Local mode uses the exact hostname, without USER or SSH.
+					target.succeed("mkdir -p /tmp/no-ssh && printf '#!/bin/sh\\ntouch /tmp/local-ssh-used\\nexit 99\\n' > /tmp/no-ssh/ssh && chmod +x /tmp/no-ssh/ssh")
+					assert target.succeed("hostname").strip() == "target"
+					v1 = "${self.nixosConfigurations.target.config.system.build.toplevel}"
+					v2 = "${self.nixosConfigurations.target-v2.config.system.build.toplevel}"
+					(status, output) = target.execute(local_cmd("--local", "compare", "-json") + " 2>/dev/null")
+					print(output)
+					results = json.loads(output)
+					assert status == 1 and len(results) == 1 and results[0]["host"] == "target", output
+					row = results[0]
+					assert (row["activeMatch"], row["bootMatch"], row["persisted"]) == (False, False, True), output
+					assert "error" not in row and "connectionError" not in row, output
+					for compare_args in [
+					    ("compare", "--local", "--on", "target-v2", "-json"),
+					    ("--on", "target-v2", "compare", "--local", "-json"),
+					]:
+					    output = target.succeed(local_cmd(*compare_args) + " 2>/dev/null")
+					    results = json.loads(output)
+					    assert len(results) == 1 and results[0]["host"] == "target-v2", output
+					    row = results[0]
+					    assert row["activeMatch"] and row["bootMatch"] and row["persisted"], output
+					output = target.succeed(local_cmd("compare", "--local", "--on", "target-v2", "-v") + " 2>&1")
+					print(output)
+					assert re.search(r"target-v2\s+Y\s+Y\s+Y", output), output
+					assert "==== Compare Report ====" in output, output
+					assert "Compare command for target-v2: realpath [" in output, output
+					assert "Compare command for target-v2: ssh" not in output, output
+
+					# Selection must fail before any command or per-host metadata evaluation.
+					(status, output) = target.execute(local_cmd("exec", "--local", "--on", ".*", "touch", "/tmp/local-selection-ran") + " 2>&1")
+					print(output)
+					assert status == 1 and "--local requires exactly one host; --on matched 3: target, target-v2, web02.example.com" in output, output
+					target.succeed("test ! -e /tmp/local-selection-ran")
+					(status, output) = target.execute(local_cmd("exec", "--local", "--on", "missing-local-host", "touch", "/tmp/local-selection-ran") + " 2>&1")
+					assert status == 1 and "no hosts matched the filter" in output, output
+					target.succeed("test ! -e /tmp/local-selection-ran")
+					assert controller.succeed("hostname").strip() == "controller"
+					(status, output) = controller.execute(local_cmd("exec", "--local", "true") + " 2>&1")
+					assert status == 1 and "no hosts matched the filter" in output and "controller" in output, output
+					for failure_args, diagnostic, evaluation_error in [
+					    (("exec", "--local", "--deployment-expr", 'cfg: throw "local-deployment-error"', "touch", "/tmp/local-selection-ran"), "error evaluating deployment info for target", "local-deployment-error"),
+					    (("compare", "--local", "--closure-path-expr", 'cfg: throw "local-closure-error"'), "error evaluating closure path for target", "local-closure-error"),
+					    (("health", "--local", "--deployment-expr", 'cfg: { healthChecks = "malformed"; }'), "failed to unmarshal deployment info for target", "cannot unmarshal"),
+					]:
+					    (status, output) = target.execute(local_cmd(*failure_args) + " 2>&1")
+					    print(output)
+					    assert status == 1 and diagnostic in output, output
+					    assert evaluation_error in output, output
+					    assert "Error: no usable local configuration: selected host was excluded (see messages above)" in output, output
+					target.succeed("test ! -e /tmp/local-selection-ran")
+
+					# Kernel hostname changes select literal keys, including deployment-less FQDNs.
+					try:
+					    target.succeed("hostname target.example.com")
+					    (status, output) = target.execute(local_cmd("exec", "--local", "true") + " 2>&1")
+					    assert status == 1 and "no hosts matched the filter" in output, output
+					    target.succeed("hostname web02.example.com")
+					    output = target.succeed(local_cmd("exec", "--local", "printf", "%s", "local-only") + " 2>&1")
+					    assert "web02.example.com: local-only" in output, output
+					    output = target.succeed(local_cmd("health", "--local", "-json") + " 2>/dev/null")
+					    assert json.loads(output) == [{"host": "web02.example.com", "ok": True, "detail": "no health checks defined"}], output
+					    (status, output) = target.execute(local_cmd("compare", "--local", "--closure-path-expr", 'cfg: "/not-the-current-system"', "-json") + " 2>/dev/null")
+					    results = json.loads(output)
+					    assert status == 1 and len(results) == 1, output
+					    row = results[0]
+					    assert row["host"] == "web02.example.com" and row["currentSystem"] == v2 and row["systemProfile"] == v2, output
+					    assert not row["activeMatch"] and not row["bootMatch"] and row["persisted"] and "error" not in row, output
+					finally:
+					    target.succeed("hostname target")
+
+					# Local exec is argv-faithful; only explicit shells interpret shell syntax.
+					output = target.succeed(local_cmd("exec", "--local", "printf", "<%s>\\n", "a b", "", "$HOME;*", "a'b") + " 2>&1")
+					assert re.findall(r"target: (<[^\n]*>)", output) == ["<a b>", "<>", "<$HOME;*>", "<a'b>"], output
+					(status, output) = target.execute(local_cmd("exec", "--local", "sh", "-c", "exit 7") + " 2>&1")
+					assert status == 1 and "target" in output and "exit status 7" in output, output
+					(status, output) = target.execute("timeout 30 " + local_cmd("exec", "--local", "--timeout", "1s", "sleep", "300") + " 2>&1")
+					assert status not in (0, 124) and "target" in output, output
+
+					# Health commands retain shell features, while local exit 255 is not SSH failure.
+					output = target.succeed(local_cmd("health", "--local", "--on", "target-v2", "-json") + " 2>/dev/null")
+					rows = json.loads(output)
+					assert len(rows) == 4 and all(row["ok"] for row in rows), output
+					deployment_expr = 'cfg: { targetHost = "192.0.2.1"; healthChecks = { loopback = { type = "tcp"; port = 9100; }; metrics = { type = "http"; url = "http://127.0.0.1:9100/metrics"; }; shellReady = { type = "output"; command = "printf ready | tr a-z A-Z"; match = "^READY$"; }; exit255 = { type = "exec"; command = "exit 255"; }; }; }'
+					health_args = ("health", "--local", "--deployment-expr", deployment_expr)
+					(status, output) = target.execute(local_cmd(*health_args, "-json") + " 2>/dev/null")
+					print(output)
+					rows = {row["check"].split(" ")[0]: row for row in json.loads(output)}
+					assert status == 1 and set(rows) == {"loopback", "metrics", "shellReady", "exit255"}, output
+					assert all(rows[name]["ok"] for name in ["loopback", "metrics", "shellReady"]), output
+					assert not rows["exit255"]["ok"] and "exit status 255" in rows["exit255"]["error"], output
+					(status, output) = target.execute(local_cmd(*health_args) + " 2>&1")
+					assert status == 1 and "FAIL" in output and "Connection failed" not in output, output
+					output = target.succeed(local_cmd(*health_args, "--ignore-check", "exit255", "-json") + " 2>/dev/null")
+					rows = json.loads(output)
+					assert len(rows) == 3 and all(row["ok"] for row in rows), output
+					explicit_host_expr = deployment_expr.replace('type = "tcp"; port = 9100;', 'type = "tcp"; port = 9100; host = "192.0.2.1";')
+					(status, output) = target.execute(local_cmd("health", "--local", "--deployment-expr", explicit_host_expr, "-c", "1", "--check", "loopback", "-json") + " 2>/dev/null")
+					rows = json.loads(output)
+					assert status == 1 and len(rows) == 1 and not rows[0]["ok"], output
+
+					# A VM-only failing realpath proves local command error classification.
+					target.succeed("mkdir -p /tmp/fail-realpath && printf '#!/bin/sh\\necho local-realpath-failed >&2\\nexit 255\\n' > /tmp/fail-realpath/realpath && chmod +x /tmp/fail-realpath/realpath")
+					failure_path = "/tmp/fail-realpath:/tmp/no-ssh:/run/current-system/sw/bin"
+					(status, output) = target.execute(local_cmd("compare", "--local", "-json", path=failure_path) + " 2>/dev/null")
+					results = json.loads(output)
+					assert status == 1 and len(results) == 1, output
+					row = results[0]
+					assert "local-realpath-failed" in row["error"] and "exit status 255" in row["error"] and not row.get("connectionError"), output
+					(status, output) = target.execute(local_cmd("compare", "--local", path=failure_path) + " 2>&1")
+					assert status == 1 and "Local error" in output and "local command errors" in output, output
+					assert "Connection failed" not in output and "Remote error" not in output, output
+
+					# Local test changes only the active system; SSH is stopped before activation.
+					target.succeed("systemctl stop sshd.service")
+					output = target.succeed("timeout 600 " + local_cmd("apply", "--local", "--deployment-expr", "cfg: { }", "test", "--show-trace") + " 2>&1")
+					print(output)
+					assert "Single target node, implicitly skipping separate build phase." in output, output
+					assert target.succeed("realpath /run/current-system").strip() == v1
+					assert target.succeed("realpath /nix/var/nix/profiles/system").strip() == v2
+					target.fail("systemctl is-active prometheus-node-exporter.service")
+					(status, output) = target.execute(local_cmd("compare", "--local", "-json") + " 2>/dev/null")
+					results = json.loads(output)
+					assert status == 1 and len(results) == 1 and results[0]["host"] == "target", output
+					row = results[0]
+					assert (row["activeMatch"], row["bootMatch"], row["persisted"]) == (True, False, False), output
+
+					# Explicit local switch restores v2 and polls the real exporter health checks.
+					target.succeed("systemctl stop sshd.service")
+					output = target.succeed("timeout 600 " + local_cmd("--local", "apply", "--on", "target-v2", "--health-timeout", "3m", "switch", "--show-trace") + " 2>&1")
+					print(output)
+					assert "Waiting for health checks" in output, output
+					target.wait_for_unit("prometheus-node-exporter.service")
+					assert target.succeed("hostname").strip() == "target"
+					assert target.succeed("realpath /run/current-system").strip() == v2
+					assert target.succeed("realpath /nix/var/nix/profiles/system").strip() == v2
+					output = target.succeed(local_cmd("compare", "--local", "--on", "target-v2", "-json") + " 2>/dev/null")
+					results = json.loads(output)
+					assert len(results) == 1 and results[0]["host"] == "target-v2", output
+					row = results[0]
+					assert row["activeMatch"] and row["bootMatch"] and row["persisted"], output
+					output = target.succeed(local_cmd("health", "--local", "--on", "target-v2", "-json") + " 2>/dev/null")
+					rows = json.loads(output)
+					assert len(rows) == 4 and all(row["ok"] for row in rows), output
+					(status, output) = target.execute(local_cmd("compare", "--local", "-json") + " 2>/dev/null")
+					results = json.loads(output)
+					assert status == 1 and len(results) == 1 and results[0]["host"] == "target", output
+					row = results[0]
+					assert (row["activeMatch"], row["bootMatch"], row["persisted"]) == (False, False, True), output
+					target.succeed("test ! -e /tmp/local-ssh-used")
 				'';
 			};
 		};

@@ -79,15 +79,16 @@ type Options struct {
 	UseSubstitutes  bool
 	Verbose         bool
 	JSONOutput      bool
+	Local           bool
 	Timeout         time.Duration
 	ConnectTimeout  int
 	Username        string
 	Parallelism     int
 	Filter          string
 
-	HealthTimeout    time.Duration
-	SkipHealthChecks bool
-	CheckFilter      string
+	HealthTimeout     time.Duration
+	SkipHealthChecks  bool
+	CheckFilter       string
 	IgnoreCheckFilter string
 }
 
@@ -241,6 +242,9 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 		return nil, fmt.Errorf("no hosts matched the filter: %s", filter.String())
 	}
 	sort.Strings(filteredHosts)
+	if opts.Local && len(filteredHosts) > 1 {
+		return nil, fmt.Errorf("--local requires exactly one host; --on matched %d: %s", len(filteredHosts), strings.Join(filteredHosts, ", "))
+	}
 
 	log.Printf("Found %d hosts matching filter", len(filteredHosts))
 
@@ -285,8 +289,8 @@ func getHostsConfigs(filter *regexp.Regexp, needsClosurePath bool) (Configuratio
 			continue
 		}
 
-		// Skip hosts with no target host
-		if result.info.TargetHost == "" {
+		// Remote hosts need an SSH target; local hosts only need valid metadata.
+		if result.info.TargetHost == "" && !opts.Local {
 			log.Printf("Excluding host %s: no target host configured", result.host)
 			continue
 		}
@@ -554,16 +558,20 @@ type checkResult struct {
 	connErr bool   // ssh transport failure (exit 255), like compareResult.connErr
 }
 
-// runHealthCheck executes a single health check. tcp and http checks run on
-// the controller (probing what a real client sees, no remote tooling needed);
-// exec and output run on the target over SSH.
+// runHealthCheck executes a single health check. tcp and http checks probe
+// from the invoking machine; exec and output run on the target, locally or
+// over SSH, with shell syntax available to configured health commands.
 func runHealthCheck(host string, cfg HostConfig, name string, c HealthCheck, username string) checkResult {
 	res := checkResult{host: host, name: name, check: c}
 	switch c.Type {
 	case "tcp":
 		dialHost := c.Host
 		if dialHost == "" {
-			dialHost = cfg.Deployment.TargetHost
+			if opts.Local {
+				dialHost = "127.0.0.1"
+			} else {
+				dialHost = cfg.Deployment.TargetHost
+			}
 		}
 		conn, err := net.DialTimeout("tcp",
 			net.JoinHostPort(dialHost, strconv.Itoa(c.Port)),
@@ -597,22 +605,24 @@ func runHealthCheck(host string, cfg HostConfig, name string, c HealthCheck, use
 		}
 		return res
 	case "exec", "output":
-		baseArgs, err := sshBaseArgs(username, cfg.Deployment.TargetHost, true, opts.TrustNewKeys)
-		if err != nil {
-			res.err = err
-			res.detail = err.Error()
-			return res
+		var cmdWithCancel *CmdWithCancel
+		if opts.Local {
+			cmdWithCancel = newCmd("sh", "-c", c.Command)
+		} else {
+			baseArgs, err := sshBaseArgs(username, cfg.Deployment.TargetHost, true, opts.TrustNewKeys)
+			if err != nil {
+				res.err = err
+				res.detail = err.Error()
+				return res
+			}
+			// A single argv element lets the remote shell interpret the command.
+			cmdWithCancel = newCmd("ssh", append(baseArgs, c.Command)...)
 		}
-		// The command is a single remote argv element after the '--'
-		// separator: the remote shell interprets it, so shell features
-		// (pipes, redirections, globs) are allowed.
-		args := append(baseArgs, c.Command)
-		cmdWithCancel := newCmd("ssh", args...)
 		defer cmdWithCancel.Cancel()
 		var stdout, stderr bytes.Buffer
 		cmdWithCancel.Stdout = &stdout
 		cmdWithCancel.Stderr = &stderr
-		err = cmdWithCancel.Run()
+		err := cmdWithCancel.Run()
 		if errors.Is(err, exec.ErrWaitDelay) {
 			// Exited successfully but stdio was held open past WaitDelay.
 			err = nil
@@ -620,7 +630,7 @@ func runHealthCheck(host string, cfg HostConfig, name string, c HealthCheck, use
 		if err != nil {
 			// ssh exits 255 on connection/authentication failure.
 			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
+			if !opts.Local && errors.As(err, &exitErr) && exitErr.ExitCode() == 255 {
 				res.connErr = true
 			}
 			res.err = err
@@ -900,6 +910,14 @@ func printSelectedHosts(configs Configurations) {
 	log.Println("----\nSelected hosts:")
 	for _, host := range sortedHosts(configs) {
 		cfg := configs[host]
+		if opts.Local {
+			if cfg.Path != "" {
+				log.Printf("%s -> local, path: %s", host, cfg.Path)
+			} else {
+				log.Printf("%s -> local", host)
+			}
+			continue
+		}
 		if cfg.Path != "" {
 			log.Printf("%s -> targetHost: %s, path: %s", host, cfg.Deployment.TargetHost, cfg.Path)
 		} else {
@@ -914,11 +932,14 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// sshAction builds a command to execute an arbitrary command on the host via SSH.
+// execAction builds a command to execute on the host locally or via SSH.
 // Each argument is shell-quoted so the remote argv matches the local one
 // (ssh joins arguments with spaces and the remote shell re-parses them);
 // shell features need an explicit 'sh -c ...' argument.
-func sshAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
+func execAction(host, address string, args []string, username string) (*CmdWithCancel, error) {
+	if opts.Local {
+		return newCmd(args[0], args[1:]...), nil
+	}
 	baseArgs, err := sshBaseArgs(username, address, true, opts.TrustNewKeys)
 	if err != nil {
 		return nil, err
@@ -935,20 +956,22 @@ func sshAction(host, address string, args []string, username string) (*CmdWithCa
 // attribute itself, so pre-quoting here would break it.
 // extraArgs are passed through to nixos-rebuild verbatim.
 func nixosRebuildArgs(host, address, username, action string, extraArgs []string) ([]string, error) {
-	if !isValidUsername(username) {
-		return nil, fmt.Errorf("invalid username: %s", username)
-	}
-	if !isValidHostname(address) {
-		return nil, fmt.Errorf("invalid hostname/address: %s", address)
-	}
 	hostAttr := fmt.Sprintf("%s#%s", opts.FlakeRef, host)
-	sshTarget := fmt.Sprintf("%s@%s", username, address)
 
 	cmdArgs := []string{action}
 	if opts.UseSubstitutes {
 		cmdArgs = append(cmdArgs, "--use-substitutes")
 	}
-	cmdArgs = append(cmdArgs, "--flake", hostAttr, "--target-host", sshTarget)
+	cmdArgs = append(cmdArgs, "--flake", hostAttr)
+	if !opts.Local {
+		if !isValidUsername(username) {
+			return nil, fmt.Errorf("invalid username: %s", username)
+		}
+		if !isValidHostname(address) {
+			return nil, fmt.Errorf("invalid hostname/address: %s", address)
+		}
+		cmdArgs = append(cmdArgs, "--target-host", fmt.Sprintf("%s@%s", username, address))
+	}
 	cmdArgs = append(cmdArgs, extraArgs...)
 	return cmdArgs, nil
 }
@@ -1165,10 +1188,10 @@ func rollingRun(configs Configurations, actionFn ActionFunc, extraArgs []string,
 	}
 
 	var (
-		sem       = make(chan struct{}, parallelism)
-		aborted   atomic.Bool
-		causeMu   sync.Mutex
-		cause     error
+		sem         = make(chan struct{}, parallelism)
+		aborted     atomic.Bool
+		causeMu     sync.Mutex
+		cause       error
 		completedMu sync.Mutex
 		completed   []string
 	)
@@ -1324,18 +1347,23 @@ func rollingRun(configs Configurations, actionFn ActionFunc, extraArgs []string,
 
 // compareAction builds the command used to compare system paths.
 func compareAction(host, address string, _ []string, username string) (*CmdWithCancel, error) {
-	baseArgs, err := sshBaseArgs(username, address, true, opts.TrustNewKeys)
-	if err != nil {
-		return nil, err
+	executable := "realpath"
+	args := []string{"/run/current-system", "/nix/var/nix/profiles/system"}
+	if !opts.Local {
+		baseArgs, err := sshBaseArgs(username, address, true, opts.TrustNewKeys)
+		if err != nil {
+			return nil, err
+		}
+		executable = "ssh"
+		args = append(baseArgs, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
 	}
-	args := append(baseArgs, "realpath", "/run/current-system", "/nix/var/nix/profiles/system")
 
 	// Debug log the command only in verbose mode
 	if opts.Verbose {
-		log.Printf("Compare command for %s: ssh %v", host, args)
+		log.Printf("Compare command for %s: %s %v", host, executable, args)
 	}
 
-	return newCmd("ssh", args...), nil
+	return newCmd(executable, args...), nil
 }
 
 type compareResult struct {
@@ -1368,7 +1396,7 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 
 			cmdWithCancel, err := compareAction(host, cfg.Deployment.TargetHost, nil, username)
 			if err != nil {
-				res.connErr = true
+				res.connErr = !opts.Local
 				res.err = fmt.Errorf("failed to create command: %w", err)
 				resultsChan <- res
 				return
@@ -1389,14 +1417,18 @@ func getCompareResults(configs Configurations, username string, parallelism int)
 				err = nil
 			}
 			if err != nil {
-				// ssh exits 255 on connection/authentication failure; any
-				// other positive exit code comes from the remote command.
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 && exitErr.ExitCode() != 255 {
-					res.err = fmt.Errorf("remote command failed: %w, stderr: \n%s", err, stderr.String())
+				if opts.Local {
+					res.err = fmt.Errorf("local command failed: %w, stderr: \n%s", err, stderr.String())
 				} else {
-					res.connErr = true
-					res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderr.String())
+					// ssh exits 255 on connection/authentication failure; other
+					// positive exit codes come from the remote command.
+					var exitErr *exec.ExitError
+					if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 && exitErr.ExitCode() != 255 {
+						res.err = fmt.Errorf("remote command failed: %w, stderr: \n%s", err, stderr.String())
+					} else {
+						res.connErr = true
+						res.err = fmt.Errorf("error executing SSH command: %w, stderr: \n%s", err, stderr.String())
+					}
 				}
 				resultsChan <- res
 				return
@@ -1636,6 +1668,9 @@ func printCompareTable(results []compareResult) (int, int, int) {
 	for _, res := range results {
 		if res.err != nil {
 			status := "Remote error"
+			if opts.Local {
+				status = "Local error"
+			}
 			if res.connErr {
 				status = "Connection failed"
 				connErrors++
@@ -1683,6 +1718,7 @@ func main() {
 		UseSubstitutes:  true,
 		Verbose:         false,
 		JSONOutput:      false,
+		Local:           false,
 		Timeout:         0,
 		ConnectTimeout:  10,
 		Username:        os.Getenv("USER"),
@@ -1699,6 +1735,7 @@ func main() {
 	flag.StringVar(&opts.FlakeRef, "flake", opts.FlakeRef, "Flake to read nixosConfigurations from (path or flake reference)")
 	flag.BoolVar(&opts.JSONOutput, "json", opts.JSONOutput, "Output compare/health results as JSON")
 	flag.StringVar(&opts.Filter, "on", opts.Filter, "Regex to select hosts by name (anchored: must match the whole name)")
+	flag.BoolVar(&opts.Local, "local", opts.Local, "Run on the local machine (defaults to selecting its hostname from the flake)")
 	flag.StringVar(&opts.Username, "l", opts.Username, "Specify the username for the target host")
 	flag.IntVar(&opts.Parallelism, "P", opts.Parallelism, "Specify the number of parallel jobs")
 	flag.IntVar(&opts.ConnectTimeout, "c", opts.ConnectTimeout, "SSH connection timeout in seconds")
@@ -1709,7 +1746,7 @@ func main() {
 	flag.BoolVar(&opts.TrustNewKeys, "trust-new-keys", opts.TrustNewKeys, "Automatically trust new server keys")
 	flag.BoolVar(&opts.UseSubstitutes, "use-substitutes", opts.UseSubstitutes, "Automatically use substitutes when rebuilding")
 	flag.BoolVar(&opts.Verbose, "v", opts.Verbose, "Enable verbose output for compare subcommand")
-	flag.DurationVar(&opts.Timeout, "timeout", opts.Timeout, "Timeout for remote commands (e.g. 5m, 1m)")
+	flag.DurationVar(&opts.Timeout, "timeout", opts.Timeout, "Timeout for commands (e.g. 5m, 1m)")
 	flag.DurationVar(&opts.HealthTimeout, "health-timeout", opts.HealthTimeout, "How long apply waits for a host's health checks to pass after a switch")
 	flag.BoolVar(&opts.SkipHealthChecks, "skip-health-checks", opts.SkipHealthChecks, "Do not wait for health checks between rolling apply batches")
 	flag.StringVar(&opts.CheckFilter, "check", opts.CheckFilter, "Regex to select health checks by name (anchored: must match the whole name)")
@@ -1768,7 +1805,25 @@ Arguments:
 	if subcommand == "exec" && len(args) < 1 {
 		log.Fatal("Error: No command specified for exec.")
 	}
-	if opts.Username == "" {
+	if opts.Local {
+		onSpecified := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "on" {
+				onSpecified = true
+			}
+		})
+		if !onSpecified {
+			hostname, err := os.Hostname()
+			if err != nil {
+				log.Fatalf("Error getting local hostname: %v", err)
+			}
+			if hostname == "" {
+				log.Fatal("Error: local hostname is empty; specify --on.")
+			}
+			opts.Filter = regexp.QuoteMeta(hostname)
+		}
+	}
+	if !opts.Local && opts.Username == "" {
 		log.Fatal("Error: no SSH username (USER is unset); specify one with -l.")
 	}
 	if opts.Parallelism <= 0 {
@@ -1817,17 +1872,19 @@ Arguments:
 	// Build NIX_SSHOPTS for nixos-rebuild's SSH connections, preserving
 	// anything the user already set. User-supplied options come first, and
 	// ssh honors the first occurrence of an option, so they take precedence.
-	sshOpts := []string{
-		"-o BatchMode=yes",
-		fmt.Sprintf("-o ConnectTimeout=%d", opts.ConnectTimeout),
+	if !opts.Local {
+		sshOpts := []string{
+			"-o BatchMode=yes",
+			fmt.Sprintf("-o ConnectTimeout=%d", opts.ConnectTimeout),
+		}
+		if opts.TrustNewKeys {
+			sshOpts = append(sshOpts, "-o StrictHostKeyChecking=accept-new")
+		}
+		if existing := os.Getenv("NIX_SSHOPTS"); existing != "" {
+			sshOpts = append([]string{existing}, sshOpts...)
+		}
+		os.Setenv("NIX_SSHOPTS", strings.Join(sshOpts, " "))
 	}
-	if opts.TrustNewKeys {
-		sshOpts = append(sshOpts, "-o StrictHostKeyChecking=accept-new")
-	}
-	if existing := os.Getenv("NIX_SSHOPTS"); existing != "" {
-		sshOpts = append([]string{existing}, sshOpts...)
-	}
-	os.Setenv("NIX_SSHOPTS", strings.Join(sshOpts, " "))
 
 	// Only compare consumes closure paths; apply lets nixos-rebuild do its
 	// own evaluation, so skipping the eval here halves its startup cost.
@@ -1841,6 +1898,9 @@ Arguments:
 		log.Fatal(err)
 	}
 	if len(configs) == 0 {
+		if opts.Local {
+			log.Fatal("Error: no usable local configuration: selected host was excluded (see messages above)")
+		}
 		log.Fatalf("Error: no deployable hosts: all hosts matching --on %q were excluded (see messages above)", opts.Filter)
 	}
 
@@ -1853,7 +1913,7 @@ Arguments:
 		// domain anywhere) yield one batch, i.e. today's all-at-once
 		// behavior; the gate only waits on hosts that define checks.
 		j := effectiveMaxConcurrentDomains(configs)
-		if err := rollingRun(configs, sshAction, args, "Exec", opts.Username, opts.Parallelism, j, includeChecks, ignoreChecks, true); err != nil {
+		if err := rollingRun(configs, execAction, args, "Exec", opts.Username, opts.Parallelism, j, includeChecks, ignoreChecks, true); err != nil {
 			log.Fatal(err)
 		}
 	case "health":
@@ -1907,7 +1967,11 @@ Arguments:
 			problems = append(problems, fmt.Sprintf("%d host(s) with connection errors", connErrors))
 		}
 		if remoteErrors > 0 {
-			problems = append(problems, fmt.Sprintf("%d host(s) with remote errors", remoteErrors))
+			if opts.Local {
+				problems = append(problems, fmt.Sprintf("%d host(s) with local command errors", remoteErrors))
+			} else {
+				problems = append(problems, fmt.Sprintf("%d host(s) with remote errors", remoteErrors))
+			}
 		}
 		if len(problems) > 0 {
 			// Keep stdout pure JSON in -json mode; the exit code and the

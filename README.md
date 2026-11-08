@@ -4,10 +4,10 @@
 
 ## Features
 
-- Execute arbitrary commands on multiple hosts via SSH.
+- Execute arbitrary commands via SSH or directly on the local machine.
 - Apply NixOS rebuild actions (`switch`, `boot`, `test`, etc.) with parallelism.
 - Rolling deploys: batch hosts by group and failure domain, gated by health checks.
-- Health checks: TCP port, HTTP request, remote command exit status, and remote command output assertions, selectable by name.
+- Health checks: TCP port, HTTP request, local/remote command exit status, and command output assertions, selectable by name.
 - Compare deployed system paths against configured paths.
 - Filter hosts using regular expressions.
 
@@ -21,6 +21,10 @@ Options may be given before or after the subcommand. Option parsing stops at the
 
 By default ninfra reads `nixosConfigurations` from the flake in the current directory; use `--flake <path or flake reference>` to point at another flake. Local paths are resolved to absolute paths, so ninfra works from any directory.
 
+Use `--local` with any subcommand to operate on the current machine instead of connecting over SSH, for example `ninfra --local compare` or `ninfra apply --local --on target-v2 switch`. By default it selects the flake key matching the literal result of `os.Hostname()`, including dots, without shortening or normalizing it or reading `config.networking.hostName`. There is no fallback to another key or all hosts. An explicit `--on` in either option position overrides hostname selection and must match exactly one key before deployment metadata is evaluated; `--on '.*'` is an explicit override and is rejected if it matches multiple keys, even when some lack deployment metadata.
+
+Local commands run as the invoking user: `USER` need not be set, `-l` and SSH key/trust settings do not select a different user, and ninfra never inserts sudo or switches users. Run ninfra with the required privileges yourself when necessary. Local mode does not modify `NIX_SSHOPTS`.
+
 ### Subcommands
 
 - **exec**: Execute a command on the specified hosts. Arguments are shell-quoted so the remote argv matches what you typed locally; to use shell features (pipes, globs, variables), pass them through an explicit shell: `ninfra exec sh -c 'systemctl list-units | grep failed'`. exec follows the same rolling schedule as apply (see below): hosts run batch by batch by group and failure domain, and after each batch ninfra waits for the completed hosts' health checks before the next batch starts — `ninfra exec -P 3 'systemctl restart myapp'` on a k=2 group runs 2 hosts, waits for their checks, then the next 2. Hosts without group/domain/checks run all at once as before. If any host's command fails, ninfra prints a per-host summary (each host as `OK` or `failed (exit N)`) and exits non-zero, skipping all not-yet-started batches.
@@ -30,6 +34,10 @@ By default ninfra reads `nixosConfigurations` from the flake in the current dire
 - **health**: Run the deployment health checks defined on the selected hosts and print a per-check table (`HOST`, `CHECK`, `STATUS`, `DETAIL`; `OK` / `FAIL` / `Connection failed`). Exits non-zero if any check fails or a host cannot be reached. Hosts with no checks (or none matching the selection filters) print a single `OK` row. With `-json`, stdout is an array of flat rows `{"host": ..., "check": "name (type:target)", "ok": bool, "error": ..., "detail": ...}`. Checks are selected with `--check` / `--ignore-check` (anchored regexes on check names, like `--on`).
 - **compare**: Compare the deployed system paths with the configured paths from the flake. Prints a table with columns HOST, ACTIVE, BOOT, PERSISTED, STATUS: ACTIVE is `Y` when the running system (`/run/current-system`) equals the flake's evaluated closure, BOOT is `Y` when the boot default (`/nix/var/nix/profiles/system`) equals it, and PERSISTED is `Y` when the running system equals the boot default (i.e. the active configuration will survive a reboot). Exits non-zero if any host mismatches, cannot be reached (`Connection failed`), or fails the remote check (`Remote error`).
 
+With `--local`, `exec` runs the supplied executable and argv directly, without an implicit shell; the same explicit `sh -c` rule applies. `health` retains configured shell commands and the existing selection and gate behavior. `compare` runs local `realpath` on the two system paths above; command failures appear as `Local error` rather than `Remote error` and are never SSH connection failures, including exit status 255. JSON fields and mismatch/exit-code semantics are unchanged.
+
+Local `apply` uses the same rebuild pipeline, single-host build skip, temporary working directories, and health gate. It generates neither `--target-host` nor `--build-host`. Extra rebuild arguments still pass through verbatim: explicitly supplying either option can request remote work even with `--local`.
+
 ### Output
 
 Progress messages, the resolved "Selected hosts" listing, per-host command output (streamed live and prefixed with the host name, with stderr lines tagged `host (stderr):`), and failure summaries all go to **stderr**. `compare` and `health` write their tables to stdout (plus a trailing summary line and, for `compare`, the `-v` report); with `-json` stdout carries just the JSON payload. This keeps that output pipeable, but note that `exec` command output is on stderr, so redirecting stdout will not capture it.
@@ -38,19 +46,20 @@ Progress messages, the resolved "Selected hosts" listing, per-host command outpu
 
 #### Common Options
 
-- `--on <filter>`: Regex to select hosts by name (default: `.*`). The pattern is anchored and must match the whole name: `--on web1` matches only the host `web1`, not `web10`; use `--on 'web1.*'` for prefix matching.
+- `--on <filter>`: Regex to select hosts by name (default: `.*` remotely, literal hostname with `--local`). The pattern is anchored and must match the whole name: `--on web1` matches only the host `web1`, not `web10`; use `--on 'web1.*'` for prefix matching.
+- `--local`: Run on the current machine, selecting its exact hostname by default; an explicit `--on` must select exactly one flake key (see Usage above). Remote execution remains the default.
 - `--flake <ref>`: Flake to read `nixosConfigurations` from (default: the current directory). Plain paths (`.`, `./infra`, `/srv/infra`) are resolved to absolute paths; anything else (registry names, `github:...` URLs) is passed to nix as-is. URL-style refs with relative paths (`path:./x`, `git+file:./x`) are not supported.
-- `-l <username>`: Specify the username for the target hosts (default: current user).
+- `-l <username>`: Specify the SSH username for the target hosts (default: current user); ignored by local execution.
 - `-P <parallelism>`: Set the number of parallel jobs (default: `1`).
-- `--timeout <duration>`: Timeout for remote commands (e.g., `5m`, `1m`; default: disabled).
+- `--timeout <duration>`: Timeout for commands, local or remote (e.g., `5m`, `1m`; default: disabled).
 - `-h`, `--help`: Display usage information.
 
 #### SSH Options
 
 - `--trust-new-keys`: Automatically trust new server keys (default: `true`).
-- `-c <seconds>`: SSH connection timeout in seconds, applied to all SSH connections including the ones nixos-rebuild makes (default: `10`).
+- `-c <seconds>`: SSH connection timeout in remote mode and TCP/HTTP health-probe timeout in either mode (default: `10`).
 
-All SSH connections run with `BatchMode=yes`, so authentication failures fail fast instead of prompting for a password. For the `apply` build/rebuild phases, ninfra passes its SSH options to `nixos-rebuild` via `NIX_SSHOPTS`; anything you already have in `NIX_SSHOPTS` (e.g. `ProxyJump`, ports, identity files) is preserved and takes precedence.
+In remote mode, all SSH connections run with `BatchMode=yes`, so authentication failures fail fast instead of prompting for a password. For the `apply` build/rebuild phases, ninfra passes its SSH options to `nixos-rebuild` via `NIX_SSHOPTS`; anything you already have in `NIX_SSHOPTS` (e.g. `ProxyJump`, ports, identity files) is preserved and takes precedence. Local mode leaves `NIX_SSHOPTS` unchanged and does not generate SSH options.
 
 #### Apply Options
 
@@ -72,7 +81,7 @@ All SSH connections run with `BatchMode=yes`, so authentication failures fail fa
 #### Advanced Options
 
 - `--list-hosts-expr <expr>`: Nix expression applied to the flake's `nixosConfigurations` to list host names (default: `builtins.attrNames`).
-- `--deployment-expr <expr>`: Nix expression (a function of a host's configuration) to extract deployment info (default: reads the whole `config.deployment` set, falling back to `config.passthru.deployment`, so a host with neither is skipped; see "Deployment attributes" below).
+- `--deployment-expr <expr>`: Nix expression (a function of a host's configuration) to extract deployment info (default: reads the whole `config.deployment` set, falling back to `config.passthru.deployment`). A host with neither is skipped remotely but usable locally with empty metadata; evaluation errors still exclude it. Local metadata is evaluated and validated even though `targetHost` is optional (see "Deployment attributes" below).
 - `--closure-path-expr <expr>`: Nix expression (a function of a host's configuration) to extract the system closure path (default: `cfg: cfg.config.system.build.toplevel.outPath`).
 
 ### Arguments
@@ -82,23 +91,25 @@ All SSH connections run with `BatchMode=yes`, so authentication failures fail fa
 - **compare**: No additional arguments required.
 - **health**: No additional arguments required.
 
-If every host matching the `--on` filter is excluded (for example because it has no `deployment.targetHost`), ninfra exits with an error instead of silently doing nothing.
+If every host matching the selection is excluded (for example because it has no `deployment.targetHost` in remote mode), ninfra exits with an error instead of silently doing nothing. Local mode also fails if its selected configuration is excluded by deployment or closure-path evaluation errors; it does not replace failing metadata with empty checks.
 
 ### Deployment attributes
 
 Deployment settings are read from the host's `config.deployment` set, falling back to `config.passthru.deployment` (typically set via `passthru.deployment = { ... };` in a NixOS module). The precedence is whole-set: if `config.deployment` exists it wins entirely — there is no per-field merge with `passthru.deployment`.
 
+`targetHost` is required only for remote execution. With `--local`, missing deployment settings are allowed; existing settings are still evaluated and validated, and ninfra neither synthesizes nor overwrites `targetHost`.
+
 ```nix
 passthru.deployment = {
-  targetHost = "web1";            # required; host is skipped without it
+  targetHost = "web1";            # required remotely; optional with --local
   group = "web";                  # optional; rolling-restart group
   maxConcurrentNodes = 2;         # hosts of this group switched at once (default 1; all hosts in a group that set it must agree)
   failureDomain = "dc1";          # optional; hosts without one form a single "" domain
   maxConcurrentDomains = 2;       # domains deployed at once (default 1; a global knob, so all hosts that set it must agree)
   healthChecks = {                # name-keyed; names are matched by --check/--ignore-check
-    exporterPort = { type = "tcp"; port = 9100; };                              # optional host = "..." overrides the dial target (default: targetHost)
+    exporterPort = { type = "tcp"; port = 9100; };                              # optional host = "..." overrides targetHost (127.0.0.1 locally)
     metrics      = { type = "http"; url = "http://web1:9100/metrics"; };        # optional expectStatus (default: any 2xx passes)
-    appActive    = { type = "exec"; command = "systemctl is-active myapp"; };    # run via ssh; pass = exit 0
+    appActive    = { type = "exec"; command = "systemctl is-active myapp"; };    # SSH or local sh -c; pass = exit 0
     appReady     = { type = "output"; command = "myapp status"; match = "^ready"; }; # pass = exit 0 AND stdout matches the regex
   };
 };
@@ -106,9 +117,9 @@ passthru.deployment = {
 
 Check types:
 
-- `tcp` — dial `host` (or `targetHost`) on `port` from the controller. Pass = connection succeeds.
-- `http` — GET `url` from the controller. Pass = status is 2xx, or exactly `expectStatus` when set.
-- `exec` — run `command` on the target over SSH (the remote shell interprets it, so pipes/redirections work). Pass = exit 0.
+- `tcp` — dial `host` on `port` from the machine running ninfra. Without `host`, use `targetHost` remotely or `127.0.0.1` with `--local`; an explicit host is always preserved. Pass = connection succeeds.
+- `http` — GET `url` from the machine running ninfra; the URL is unchanged in local mode. Pass = status is 2xx, or exactly `expectStatus` when set.
+- `exec` — run `command` on the target over SSH, or via local `sh -c` with `--local`. The shell interprets pipes/redirections in either mode, unlike the argv-faithful `exec` subcommand. Pass = exit 0; local failures (including exit 255) are `FAIL`, never `Connection failed`.
 - `output` — like `exec`, but also requires stdout to match the `match` regex.
 
 Validation runs before every operation: unknown types, out-of-range ports, empty URLs/commands, unparseable match regexes, and disagreeing `maxConcurrentNodes`/`maxConcurrentDomains` values abort with an error naming the host and check. Unset knobs (`0`) never conflict with set ones.
